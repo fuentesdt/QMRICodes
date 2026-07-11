@@ -129,14 +129,41 @@ CORE PROCESS (COMMON)
 - Save outputs and metrics
 
 --------------------------------------------------
-RECOMMENDED WORKFLOW
+RECOMMENDED WORKFLOW (5-fold CV on the anonymized CSV cohort)
 --------------------------------------------------
+
+The two recommended scripts now run 5-fold cross-validation over the anonymized
+MAGiC cohort indexed by a CSV (schema in doc/fulldataset.md), instead of LOPO
+over acq_params.xlsx. Patients are grouped by AnonymizationID into 5 folds.
+
+Acquisition parameters (TR/TE/FA/TI) are read per patient directly from the
+DICOM header via readAcqParams(), using the CSV's dicom_path and
+"Series UID (Ax MAGiC)" columns (RepetitionTime/EchoTime/FlipAngle/InversionTime).
+config.acq is only an optional fallback for tags a header happens to lack.
+
+Before running, edit the CONFIG block at the top of each script:
+- config.csvName : cohort CSV filename in the root folder (default dataset.csv)
+- config.useRefMaps : true if PD/T1/T2 reference maps exist; false = signal-only
+- config.requireMatched : keep only rows with a valid match_status
+- config.outRoot : where per-patient outputs are written
 
 1. Train using:
    run_qmri_3dcnn_NonNormalSingalLeaveOneOutTraining_Automatic.m
+   - Reads config.csvName, assigns 5 folds, writes the PHI-free manifest
+     cv_folds.csv (AnonymizationID,fold), and saves one model per fold in
+     trained_models_Fold1/ ... trained_models_Fold5/.
 
 2. Predict using:
    predict_qmri_3dcnn_NonNormalSignal_AutomatedAnonymizedFolders.m
+   - Select a trained_models_Fold<f> model; the script reads cv_folds.csv and
+     predicts that fold's held-out patients (set config.predictAll=true for all).
+   - Outputs go to <outRoot>/<AnonymizationID>/Fold<f>_Predictions/.
+
+PHI PROTECTION (see ../radpathsandbox/CLAUDE.md):
+Only AnonymizationID is ever printed or used in file/folder names. MRN, Study
+UID, and Series UID are never logged or written. Every required input file is
+gated by requireFile() (fail fast) before it is read. cv_folds.csv contains only
+AnonymizationID and fold number.
 
 --------------------------------------------------
 NOTES

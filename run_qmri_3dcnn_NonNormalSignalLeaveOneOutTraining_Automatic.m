@@ -1,62 +1,98 @@
-%% run_qmri_3dcnn_Leave_One_Out
+%% run_qmri_3dcnn_5FoldCV
 % 3D CNN (U-Net) for qMRI: predict PD, T1, T2, g1, g2, g3
 % Physics-guided loss (no T2* in GRE)
 % Auto CPU/GPU. T1 in (0,5000], T2 in (0,3000], PD in [0,150].
+%
+% Reads the anonymized MAGiC cohort CSV (schema in doc/fulldataset.md) and runs
+% 5-fold cross-validation (patients grouped by AnonymizationID). Fold f trains on
+% the other 4 folds and its model is saved in trained_models_Fold<f>/.
+%
+% PHI PROTECTION (see ../radpathsandbox/CLAUDE.md):
+%   - Only AnonymizationID is ever printed / used in folder & file names.
+%   - MRN, Study UID, Series UID are NEVER read into logs or written to disk.
+%   - Every required input file is gated by requireFile() (fail fast) before use.
 
 clear; clc; close all;
 
 %% ===================== 0) MASTER CONFIG ==========================
 config.rootDir   = pwd;
-config.excelName = "acq_params.xlsx";
-config.idCol     = "PatientID";
+config.csvName   = "dataset.csv";        % anonymized cohort CSV (doc/fulldataset.md schema)
+config.idCol     = "AnonymizationID";    % PHI-safe patient key
+config.numFolds  = 5;                    % K in K-fold CV
+config.seed      = 42;                   % deterministic fold assignment
 
-% Read one Excel file containing ALL patients
-excelPath = fullfile(config.rootDir, config.excelName);
-assert(isfile(excelPath), 'Excel file not found: %s', excelPath);
+% Where per-patient prediction/training artifacts may be written. Patients are
+% indexed by CSV path, not by a subfolder of rootDir, so give a writable root.
+config.outRoot   = config.rootDir;
 
-Tall = readtable(excelPath);
-assert(any(strcmpi(Tall.Properties.VariableNames, config.idCol)), ...
-    'Missing ID column "%s".', config.idCol);
+% Only keep CSV rows whose match_status marks a valid DICOM<->synthetic match.
+config.requireMatched = true;
 
-needCols = ["TRT1","TET1","FAT1_deg","TRT2","TET2","TRFLAIR","TEFLAIR","TIFLAIR"];
-for c = needCols
-    assert(any(strcmpi(Tall.Properties.VariableNames, c)), ...
-        'Excel missing column "%s".', c);
-end
+% ---- Acquisition parameters (TR/TE/FA/TI) --------------------------------
+% Read per patient from the DICOM header (dicom_path + "Series UID (Ax MAGiC)")
+% by readAcqParams(). The physics forward model (synthSignals) REQUIRES them.
+% config.acq is an OPTIONAL fallback [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR
+% TIFLAIR]: any positive entry is used only when the DICOM header lacks that tag.
+% Leave as zeros to require every value to come from DICOM (fail fast otherwise).
+config.acq = [   0,    0,    0,     0,    0,      0,       0,       0 ];   % optional fallback
+
+% ---- Reference quantitative maps -----------------------------------------
+% true  -> train against PD/T1/T2 reference maps (parameter L1 term active).
+% false -> signal-only training (lamPD/lamT1/lamT2 forced to 0, refs = zeros).
+config.useRefMaps = true;
+
+% Fixed filenames looked up inside each row's synthentic_path when the CSV does
+% not carry a direct per-contrast path. Overridden by CSV columns when present.
+config.fileT1w     = "T1W_Synthetic.nii.gz";    % Synthetic T1W signal
+config.fileT2w     = "T2W_Synthetic.nii.gz";    % Synthetic T2W signal
+config.fileFLAIR   = "FLAIR_Synthetic.nii.gz";  % Synthetic FLAIR signal
+config.filePDref   = "pdmap.nii.gz";            % Reference PD map
+config.fileT1ref   = "t1map.nii.gz";            % Reference T1 map
+config.fileT2ref   = "t2map.nii.gz";            % Reference T2 map
+config.fileMask    = "mask.nii.gz";             % Mask of skull-stripped brain (optional)
+
+%% ===================== 0.1) READ COHORT CSV ======================
+csvPath = fullfile(config.rootDir, config.csvName);
+Tall = readCohortCSV(csvPath, config);
 
 allPatientIDs = string(Tall.(config.idCol));
 allPatientIDs = allPatientIDs(~ismissing(allPatientIDs) & strlength(allPatientIDs)>0);
+allPatientIDs = unique(allPatientIDs, 'stable');   % one entry per patient
+Num_patients  = numel(allPatientIDs);
+assert(Num_patients >= config.numFolds, ...
+    'Need at least %d patients for %d-fold CV; found %d.', ...
+    config.numFolds, config.numFolds, Num_patients);
 
-Num_patients = numel(allPatientIDs);
+%% ===================== 0.2) ASSIGN & PERSIST FOLDS ===============
+foldOfPatient = assignFolds(allPatientIDs, config.numFolds, config.seed);
 
-% Num_patients = 11;   % this number can change with data availability
-%% ===================== 1) Leave One Patient Out (LOPO) Training ==========================
-for L = 1:Num_patients
+% Persist a PHI-free manifest so the prediction script uses identical folds.
+foldTable = table(allPatientIDs(:), foldOfPatient(:), ...
+    'VariableNames', {char(config.idCol), 'fold'});
+writetable(foldTable, fullfile(config.rootDir, 'cv_folds.csv'));
+fprintf('[CV] %d patients split into %d folds. Manifest: cv_folds.csv\n', ...
+    Num_patients, config.numFolds);
 
-    leftOutID = allPatientIDs(L);
+%% ===================== 1) 5-Fold Cross-Validation Training =======
+for f = 1:config.numFolds
+
+    heldOutIDs = allPatientIDs(foldOfPatient == f);
+    trainIDs   = allPatientIDs(foldOfPatient ~= f);
 
     fprintf('\n============================================\n');
-    fprintf('LOPO Fold %d/%d: Leaving out patient %s\n', ...
-        L, Num_patients, leftOutID);
+    fprintf('CV Fold %d/%d: training on %d patients, holding out %d\n', ...
+        f, config.numFolds, numel(trainIDs), numel(heldOutIDs));
     fprintf('============================================\n');
 
-    % Training table excludes the left-out patient
-    T = Tall(string(Tall.(config.idCol)) ~= leftOutID, :);
+    % This fold trains on all patients NOT in fold f.
+    T = Tall(ismember(string(Tall.(config.idCol)), trainIDs), :);
 
-    % Output folder clearly says which patient was left out
-    config.outDir = fullfile(config.rootDir, ...
-        sprintf('trained_models_LeftOut_%s', leftOutID));
+    % Output folder clearly says which fold this is.
+    config.outDir = fullfile(config.outRoot, sprintf('trained_models_Fold%d', f));
 
     if ~exist(config.outDir,'dir')
         mkdir(config.outDir);
     end
-    config.fileT1w     = "PREOP_T1_W_S.nii.gz";     % Acquired T1W Signal
-    config.fileT2w     = "PREOP_AxT2_W_S.nii.gz";   % Acquired T2W Signal
-    config.fileFLAIR   = "PREOP_FLAIR_W_S.nii.gz";  % Acquired Flair Signal
-    config.filePDref   = "pdmap.nii.gz";            % Reference PD Map
-    config.fileT1ref   = "t1map.nii.gz";            % Reference T1 Map
-    config.fileT2ref   = "t2map.nii.gz";            % Reference T2 Map
-    config.fileMask    = "mask.nii.gz";             % Mask of Skull-stripped brain
 
     % Training Network architechture definition
     config.patchSize   = [64 64 64];   % [Z Y X]
@@ -72,6 +108,10 @@ for L = 1:Num_patients
     config.lamPD       = 1.0;        % parameter L1 (PD)
     config.lamT1       = 1.0;        % parameter L1 (log T1)
     config.lamT2       = 1.0;        % parameter L1 (log T2)
+    if ~config.useRefMaps
+        % Signal-only training: disable the reference-map parameter L1 term.
+        config.lamPD = 0; config.lamT1 = 0; config.lamT2 = 0;
+    end
 
     % Output ranges (HARD CAPS via scaled sigmoid)
     config.PDmax       = 150;
@@ -104,55 +144,63 @@ for L = 1:Num_patients
     end
 
     %% ===================== 3) DISCOVER PATIENTS ===============
+    % Resolve each training patient's files from the CSV row (per-contrast path
+    % column, or fixed name inside synthentic_path). requireFile() fails fast on
+    % any missing REQUIRED input; identifies files by AnonymizationID only (PHI).
     patientIDs = string(T.(config.idCol));
     patientIDs = patientIDs(~ismissing(patientIDs) & strlength(patientIDs)>0);
+    patientIDs = unique(patientIDs, 'stable');
 
-    patients = struct('id',{},'paths',{},'acq',[]);
-    for L = 1:numel(patientIDs)
-        pid = patientIDs(L);
-        pdir = fullfile(config.rootDir, pid);
-        if ~isfolder(pdir), warning('Missing folder: %s (skip)', pdir); continue; end
-        paths.T1w   = fullfile(pdir, config.fileT1w);
-        paths.T2w   = fullfile(pdir, config.fileT2w);
-        paths.FLAIR = fullfile(pdir, config.fileFLAIR);
-        paths.PDref = fullfile(pdir, config.filePDref);
-        paths.T1ref = fullfile(pdir, config.fileT1ref);
-        paths.T2ref = fullfile(pdir, config.fileT2ref);
-        paths.mask  = fullfile(pdir, config.fileMask);
-
-        miss = {};
-        fn = fieldnames(paths);
-        for f = 1:numel(fn), if ~isfile(paths.(fn{f})), miss{end+1} = fn{f}; end, end
-        if ~isempty(miss), warning('%s missing: %s (skip)', pid, strjoin(miss,', ')); continue; end
-
+    patients = struct('id',{},'paths',{},'acq',{});
+    for k = 1:numel(patientIDs)
+        pid = patientIDs(k);
         row = T(strcmp(string(T.(config.idCol)), pid), :);
-        acq = [row.TRT1,row.TET1,row.FAT1_deg,row.TRT2,row.TET2,row.TRFLAIR,row.TEFLAIR,row.TIFLAIR];
-        patients(end+1) = struct('id',pid,'paths',paths,'acq',acq);
+        row = row(1,:);                                   % one row per patient
+        paths = resolvePatientFiles(row, config);         % struct of file paths
+        acq   = readAcqParams(row, config);               % TR/TE/FA/TI from DICOM
+        patients(end+1) = struct('id', pid, 'paths', paths, 'acq', acq); %#ok<SAGROW>
     end
     assert(~isempty(patients),'No valid patients found.');
 
     %% ===================== 4) LOAD + PATCH ====================
     fprintf('[Data] Loading volumes & building patches...\n');
+
     allPatches = {};
     for k = 1:numel(patients)
         P  = patients(k);
-        S1 = readNii(P.paths.T1w);
-        S2 = readNii(P.paths.T2w);
-        S3 = readNii(P.paths.FLAIR);
-        PD = readNii(P.paths.PDref);
-        T1 = readNii(P.paths.T1ref);
-        T2 = readNii(P.paths.T2ref);
-        M  = logical(readNii(P.paths.mask));
+        S1 = readNii(requireFile(P.paths.T1w,   P.id, 'T1W'));
+        S2 = readNii(requireFile(P.paths.T2w,   P.id, 'T2W'));
+        S3 = readNii(requireFile(P.paths.FLAIR, P.id, 'FLAIR'));
+
+        if config.useRefMaps
+            PD = readNii(requireFile(P.paths.PDref, P.id, 'PDref'));
+            T1 = readNii(requireFile(P.paths.T1ref, P.id, 'T1ref'));
+            T2 = readNii(requireFile(P.paths.T2ref, P.id, 'T2ref'));
+        else
+            % Signal-only training: no reference maps, param L1 term disabled.
+            PD = zeros(size(S1),'single');
+            T1 = zeros(size(S1),'single');
+            T2 = zeros(size(S1),'single');
+        end
+
+        % Mask is optional; fall back to nonzero-signal support if absent.
+        if ~isempty(P.paths.mask) && isfile(P.paths.mask)
+            M = logical(readNii(P.paths.mask));
+        else
+            M = S1 ~= 0;
+        end
+
         assert(isequal(size(S1),size(S2),size(S3),size(PD),size(T1),size(T2),size(M)), ...
             'Size mismatch for %s', P.id);
 
         % Build patches
         patches = extractPatches3D(S1,S2,S3,PD,T1,T2,M,config.patchSize,config.patchStride);
 
-        % Attach acquisition vector (flip angle -> rad)
+        % Attach this patient's acquisition vector (flip angle -> radians).
+        acqVec = single([P.acq(1), P.acq(2), deg2rad(P.acq(3)), ...
+            P.acq(4), P.acq(5), P.acq(6), P.acq(7), P.acq(8)]);
         for p = 1:numel(patches)
-            patches{p}.acq = single([P.acq(1),P.acq(2),deg2rad(P.acq(3)), ...
-                P.acq(4),P.acq(5),P.acq(6),P.acq(7),P.acq(8)]);
+            patches{p}.acq = acqVec;
         end
         allPatches = [allPatches; patches(:)];
         fprintf('  %s -> %d patches\n', P.id, numel(patches));
@@ -277,6 +325,287 @@ for L = 1:Num_patients
     fprintf('Done. Best val = %.2e\n', bestVal);
 end
 %% ===================== LOCAL FUNCTIONS ====================
+
+function T = readCohortCSV(csvPath, config)
+% Read the anonymized MAGiC cohort CSV (schema: doc/fulldataset.md).
+% PHI-safe: only the AnonymizationID + image-path + match_status columns are
+% touched here; MRN / Study UID / Series UID are never surfaced.
+assert(isfile(csvPath), 'Cohort CSV not found: %s', csvPath);
+
+% 'preserve' keeps headers with spaces/parens, e.g. "Series UID (Ax MAGiC)".
+T = readtable(csvPath, 'VariableNamingRule', 'preserve');
+
+assert(any(strcmp(T.Properties.VariableNames, config.idCol)), ...
+    'CSV missing required ID column "%s".', config.idCol);
+
+% Optionally keep only rows whose match_status marks a valid match.
+if config.requireMatched && any(strcmpi(T.Properties.VariableNames, 'match_status'))
+    ms = string(T.(matchVar(T,'match_status')));
+    keep = ismember(lower(strtrim(ms)), ["matched","match","ok","valid","true","1"]);
+    if any(keep)
+        T = T(keep, :);
+    else
+        warning('requireMatched is on but no rows matched a known match_status; keeping all rows.');
+    end
+end
+
+% Drop rows with an empty AnonymizationID and dedupe to one row per patient.
+ids = string(T.(config.idCol));
+T   = T(~ismissing(ids) & strlength(strtrim(ids)) > 0, :);
+[~, ia] = unique(string(T.(config.idCol)), 'stable');
+T = T(ia, :);
+end
+
+
+function paths = resolvePatientFiles(row, config)
+% Resolve absolute file paths for one patient's contrasts + reference maps.
+% Strategy per file: use a direct per-contrast path column from the CSV when
+% present/non-empty; otherwise look for a fixed filename inside synthentic_path.
+baseDir = firstNonEmpty(row, ["synthentic_path","synthetic_path","dicom_path"]);
+
+paths.T1w   = pickPath(row, ["T1W Synthetic","T1W_Synthetic","T1W"],     baseDir, config.fileT1w);
+paths.T2w   = pickPath(row, ["T2W Synthetic","T2W_Synthetic","T2W"],     baseDir, config.fileT2w);
+paths.FLAIR = pickPath(row, ["FLAIR Synthetic","FLAIR_Synthetic","FLAIR"], baseDir, config.fileFLAIR);
+
+% Reference quant maps. "PS Synthetic" is treated as the PD/proton-density map.
+paths.PDref = pickPath(row, ["PS Synthetic","PD Synthetic","PDref","PS_Synthetic"], baseDir, config.filePDref);
+paths.T1ref = pickPath(row, ["T1 Map","T1map","T1ref"],  baseDir, config.fileT1ref);
+paths.T2ref = pickPath(row, ["T2 Map","T2map","T2ref"],  baseDir, config.fileT2ref);
+
+% Mask is optional (empty string if not found).
+paths.mask  = pickPath(row, ["mask","Mask"], baseDir, config.fileMask, true);
+end
+
+
+function p = pickPath(row, colCandidates, baseDir, fixedName, optional)
+% Resolve one file path: prefer a CSV column value; else baseDir/fixedName.
+% Tries both the given name and its .nii/.nii.gz variant.
+if nargin < 5, optional = false; end
+p = '';
+
+% 1) direct path from a CSV column
+v = firstNonEmpty(row, colCandidates);
+if strlength(v) > 0
+    cand = resolveExt(char(v));
+    if ~isempty(cand), p = cand; return; end
+    p = char(v);   % return as-is; requireFile will report if missing
+    return;
+end
+
+% 2) fixed filename inside baseDir
+if strlength(string(baseDir)) > 0
+    cand = resolveExt(fullfile(char(baseDir), char(fixedName)));
+    if ~isempty(cand), p = cand; return; end
+    if ~optional, p = fullfile(char(baseDir), char(fixedName)); end
+end
+end
+
+
+function out = resolveExt(pathIn)
+% Return an existing file trying pathIn, pathIn+.gz, and pathIn-.gz. '' if none.
+out = '';
+cands = string(pathIn);
+if endsWith(pathIn, ".gz")
+    cands(end+1) = erase(string(pathIn), ".gz");
+elseif endsWith(pathIn, ".nii")
+    cands(end+1) = string(pathIn) + ".gz";
+end
+for i = 1:numel(cands)
+    if isfile(cands(i)), out = char(cands(i)); return; end
+end
+end
+
+
+function v = firstNonEmpty(row, colCandidates)
+% First non-empty string value among candidate column names (case-insensitive).
+v = "";
+for i = 1:numel(colCandidates)
+    name = matchVar(row, colCandidates(i));
+    if strlength(name) == 0, continue; end
+    val = row.(name);
+    if iscell(val), val = val{1}; end
+    val = strtrim(string(val));
+    if strlength(val) > 0 && ~ismember(lower(val), ["nan","na","<missing>"])
+        v = val; return;
+    end
+end
+end
+
+
+function name = matchVar(T, candidate)
+% Case-insensitive lookup of a single column name; "" if absent.
+name = "";
+hit = find(strcmpi(T.Properties.VariableNames, candidate), 1);
+if ~isempty(hit), name = string(T.Properties.VariableNames{hit}); end
+end
+
+
+function acq = readAcqParams(row, config)
+% Read the MAGiC acquisition parameters from DICOM headers for one patient.
+% Returns [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR TIFLAIR] with FA in
+% DEGREES (callers convert to radians). PHI-safe: only numeric MR timing tags are
+% ever read out of the header; the header struct is never logged or persisted.
+%
+% Source: the Ax MAGiC acquisition series (dicom_path, matched by
+% "Series UID (Ax MAGiC)"). If a synthetic-contrast column points at its own
+% DICOM, that contrast's header is used instead (its synthesis TR/TE/FA/TI).
+% Missing tags fall back to a positive config.acq(k); otherwise -> fail fast.
+
+dcmPath   = firstNonEmpty(row, ["dicom_path"]);
+seriesUID = firstNonEmpty(row, ["Series UID (Ax MAGiC)","Series UID","SeriesUID","Series_UID"]);
+baseInfo  = readDicomHeader(dcmPath, seriesUID);
+
+t1Info = pickContrastHeader(row, ["T1W Synthetic","T1W_Synthetic","T1W"],       baseInfo);
+t2Info = pickContrastHeader(row, ["T2W Synthetic","T2W_Synthetic","T2W"],       baseInfo);
+flInfo = pickContrastHeader(row, ["FLAIR Synthetic","FLAIR_Synthetic","FLAIR"], baseInfo);
+
+fb = zeros(1,8);
+if isfield(config,'acq') && numel(config.acq)==8, fb = double(config.acq(:)'); end
+
+acq    = zeros(1,8);
+acq(1) = dicomNum(t1Info,'RepetitionTime', fb(1));
+acq(2) = dicomNum(t1Info,'EchoTime',       fb(2));
+acq(3) = dicomNum(t1Info,'FlipAngle',      fb(3));
+acq(4) = dicomNum(t2Info,'RepetitionTime', fb(4));
+acq(5) = dicomNum(t2Info,'EchoTime',       fb(5));
+acq(6) = dicomNum(flInfo,'RepetitionTime', fb(6));
+acq(7) = dicomNum(flInfo,'EchoTime',       fb(7));
+acq(8) = dicomNum(flInfo,'InversionTime',  fb(8));
+
+miss = find(~(acq > 0));
+if ~isempty(miss)
+    names  = ["TRT1","TET1","FAT1_deg","TRT2","TET2","TRFLAIR","TEFLAIR","TIFLAIR"];
+    anonID = string(row.(config.idCol));
+    if iscell(anonID), anonID = string(anonID{1}); end
+    error('qMRI:AcqParam', ...
+        'Could not resolve acquisition parameter(s) %s from DICOM for patient %s.', ...
+        strjoin(cellstr(names(miss)), ', '), anonID(1));
+end
+end
+
+
+function info = readDicomHeader(pathIn, seriesUID)
+% dicominfo for a representative slice of the target series; [] if unavailable.
+% Reuses the repo's dir('*.dcm')/dicominfo idiom (see dicomLoaderAndViewer.m).
+info = [];
+if strlength(string(pathIn)) == 0, return; end
+p = char(pathIn);
+
+if isfolder(p)
+    files = dir(fullfile(p, '*.dcm'));
+    if isempty(files)
+        all = dir(fullfile(p, '*'));            % some exports drop the .dcm extension
+        files = all(~[all.isdir]);
+    end
+    if isempty(files), return; end
+    % Prefer a file whose SeriesInstanceUID matches the requested series.
+    for i = 1:numel(files)
+        fp = fullfile(files(i).folder, files(i).name);
+        try, hdr = dicominfo(fp); catch, continue; end
+        if strlength(string(seriesUID)) == 0 || ...
+                (isfield(hdr,'SeriesInstanceUID') && strcmp(hdr.SeriesInstanceUID, char(seriesUID)))
+            info = hdr; return;
+        end
+    end
+    % No UID match -> first readable header.
+    for i = 1:numel(files)
+        try, info = dicominfo(fullfile(files(i).folder, files(i).name)); return; catch, end
+    end
+elseif isfile(p)
+    try, info = dicominfo(p); catch, info = []; end
+end
+end
+
+
+function info = pickContrastHeader(row, cols, fallbackInfo)
+% If a contrast column points at a DICOM (not a NIfTI), read its header;
+% otherwise reuse fallbackInfo (the Ax MAGiC acquisition header).
+info = fallbackInfo;
+v = firstNonEmpty(row, cols);
+if strlength(v) == 0, return; end
+p = char(v);
+isNii = endsWith(lower(p), ".nii") || endsWith(lower(p), ".nii.gz") || endsWith(lower(p), ".gz");
+if isNii, return; end
+if isfolder(p) || isfile(p)
+    hdr = readDicomHeader(p, "");
+    if ~isempty(hdr), info = hdr; end
+end
+end
+
+
+function v = dicomNum(info, field, fallback)
+% Numeric MR timing tag from a dicominfo struct (checks top-level and the
+% enhanced-DICOM shared functional groups). Uses fallback (>0) if not found.
+v = 0;
+raw = dicomTag(info, field);
+if ~isempty(raw) && isnumeric(raw) && isfinite(raw(1)), v = double(raw(1)); end
+if ~(v > 0) && nargin >= 3 && ~isempty(fallback) && fallback > 0
+    v = double(fallback);
+end
+end
+
+
+function raw = dicomTag(info, field)
+% Look up a tag at the top level, else in the enhanced-DICOM
+% SharedFunctionalGroupsSequence (MR Timing / Echo / Modifier sequences).
+raw = [];
+if isempty(info) || ~isstruct(info), return; end
+if isfield(info, field) && ~isempty(info.(field)), raw = info.(field); return; end
+
+if isfield(info, 'SharedFunctionalGroupsSequence')
+    sfg = info.SharedFunctionalGroupsSequence;
+    if isstruct(sfg)
+        items = struct2cell(sfg);              % Item_1, Item_2, ...
+        groups = {'MRTimingAndRelatedParametersSequence', ...
+                  'MREchoSequence', 'MRModifierSequence', ...
+                  'MRImagingModifierSequence'};
+        for a = 1:numel(items)
+            it = items{a};
+            if ~isstruct(it), continue; end
+            for g = 1:numel(groups)
+                if isfield(it, groups{g})
+                    gc = struct2cell(it.(groups{g}));
+                    for b = 1:numel(gc)
+                        sub = gc{b};
+                        if isstruct(sub) && isfield(sub, field) && ~isempty(sub.(field))
+                            raw = sub.(field); return;
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+end
+
+
+function p = requireFile(pathIn, anonID, tag)
+% Fail-fast gate (mirrors radpathsandbox/validate_data_files.py). Errors identify
+% the file by AnonymizationID + contrast tag ONLY -- never a PHI path fragment.
+if isempty(pathIn) || ~isfile(pathIn)
+    error('qMRI:MissingFile', ...
+        'Required %s file for patient %s not found.', tag, anonID);
+end
+p = pathIn;
+end
+
+
+function foldOfPatient = assignFolds(anonIDs, K, seed)
+% Deterministic patient-level K-fold assignment. Same seed -> same folds, so the
+% prediction script (which reads cv_folds.csv) stays consistent with training.
+ids = unique(string(anonIDs), 'stable');
+n   = numel(ids);
+rng(seed);
+perm = randperm(n);
+folds = mod(perm - 1, K) + 1;      % near-equal fold sizes
+% Map back to the input order of anonIDs.
+foldOfPatient = zeros(numel(anonIDs), 1);
+for i = 1:numel(anonIDs)
+    j = find(ids == string(anonIDs(i)), 1);
+    foldOfPatient(i) = folds(j);
+end
+end
+
 
 function tf = canUseGPU()
 tf = false; try, tf = gpuDeviceCount>0; catch, end
