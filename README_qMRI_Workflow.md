@@ -144,9 +144,15 @@ Acquisition parameters (TR/TE/FA/TI) are read per patient from the NIfTI header
 from each contrast's DICOM (RepetitionTime/EchoTime/FlipAngle/InversionTime).
 config.acq is only an optional fallback for tags a header happens to lack.
 
+Python setup (one time), for the preprocessing step:
+   python3 -m venv /opt/qmricodes
+   /opt/qmricodes/bin/pip install -r requirements.txt
+Then invoke the preprocessor with that interpreter, e.g.
+   /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py ...
+
 0. Preprocess (run once, before MATLAB), converts DICOM -> processed/<id>/*.nii.gz
    and stamps the acq tags into each NIfTI header:
-     python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
+     /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
    Add --require-matched to convert only rows with a valid match_status.
 
 Before running the MATLAB scripts, edit the CONFIG block at the top of each:
