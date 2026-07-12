@@ -148,7 +148,7 @@ Before running, edit the CONFIG block at the top of each script:
 - config.outRoot : where per-patient outputs are written
 
 1. Train using:
-   run_qmri_3dcnn_NonNormalSingalLeaveOneOutTraining_Automatic.m
+   run_qmri_3dcnn_NonNormalSignalLeaveOneOutTraining_Automatic.m
    - Reads config.csvName, assigns 5 folds, writes the PHI-free manifest
      cv_folds.csv (AnonymizationID,fold), and saves one model per fold in
      trained_models_Fold1/ ... trained_models_Fold5/.
