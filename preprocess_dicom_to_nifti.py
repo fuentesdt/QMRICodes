@@ -73,6 +73,42 @@ def is_matched(row: pd.Series) -> bool:
     return (val == "") or (val.strip().lower() in MATCHED_OK)
 
 
+def resolve_source(row: pd.Series, candidates, data_root: str):
+    """Locate a contrast's DICOM source.
+
+    Returns (resolved_path, raw_value, tried_paths). The raw value from the
+    contrast column may be an absolute path, a path relative to CWD, or a name
+    relative to ``synthentic_path`` / ``dicom_path`` / ``--data-root``. We try
+    each and return the first that exists so the caller can report exactly what
+    was attempted when nothing is found.
+    """
+    raw = first_col(row, candidates)
+    if not raw:
+        return "", "", []
+
+    syn = first_col(row, ["synthentic_path", "synthetic_path"])
+    dcm = first_col(row, ["dicom_path"])
+
+    tried = [raw]                                   # as given (abs or CWD-relative)
+    if not os.path.isabs(raw):
+        if syn:
+            tried.append(os.path.join(syn, raw))
+        if dcm:
+            tried.append(os.path.join(dcm, raw))
+        if data_root:
+            tried.append(os.path.join(data_root, raw))
+            if syn:
+                tried.append(os.path.join(data_root, syn, raw))
+    elif data_root:
+        # absolute path recorded on another machine: retry under data_root
+        tried.append(os.path.join(data_root, raw.lstrip("/\\")))
+
+    for cand in tried:
+        if os.path.exists(cand):
+            return cand, raw, tried
+    return "", raw, tried
+
+
 def read_series(path: str) -> sitk.Image:
     """Read a DICOM series (directory) or a single DICOM file as a SimpleITK image.
 
@@ -138,15 +174,55 @@ def stamp_descrip(nii_path: str, descrip: str) -> None:
     img.to_filename(nii_path)
 
 
+def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
+    """Print the path-like column values for the first patient so the operator can
+    see what the contrast columns actually contain (path? flag? relative name?)."""
+    anon = str(row[id_real]).strip()
+    print(f"[preview] first patient {anon} -- raw column values:")
+    for label, cands in (
+        ("dicom_path",      ["dicom_path"]),
+        ("synthentic_path", ["synthentic_path", "synthetic_path"]),
+    ):
+        val = first_col(row, cands)
+        if val == "":
+            print(f"    {label:16s}= <empty/absent>")
+        else:
+            exists = "exists" if os.path.exists(val) else "NOT a path on this host"
+            print(f"    {label:16s}= {val!r}  ({exists})")
+    for label, cands in (
+        ("T1W Synthetic",   ["T1W Synthetic", "T1W_Synthetic", "T1W"]),
+        ("T2W Synthetic",   ["T2W Synthetic", "T2W_Synthetic", "T2W"]),
+        ("FLAIR Synthetic", ["FLAIR Synthetic", "FLAIR_Synthetic", "FLAIR"]),
+        ("PS Synthetic",    ["PS Synthetic", "PD Synthetic", "PS_Synthetic"]),
+    ):
+        resolved, raw, _ = resolve_source(row, cands, data_root)
+        if raw == "":
+            print(f"    {label:16s}= <empty/absent>")
+        elif resolved:
+            print(f"    {label:16s}= {raw!r}  (found -> {resolved})")
+        else:
+            print(f"    {label:16s}= {raw!r}  (NOT resolvable to a file/dir)")
+    print("[preview] if the *_Synthetic values are not paths (e.g. True/1), the "
+          "files likely live inside synthentic_path -- use --data-root or tell me "
+          "the layout.")
+
+
 def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
-        overwrite: bool, dry_run: bool) -> int:
+        overwrite: bool, dry_run: bool, data_root: str) -> int:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 
     # Resolve the id column case-insensitively.
     id_lookup = {str(c).strip().lower(): c for c in df.columns}
     id_real = id_lookup.get(id_col.strip().lower())
     if id_real is None:
-        sys.exit(f"[error] id column '{id_col}' not found in {csv_path}")
+        sys.exit(f"[error] id column '{id_col}' not found. Columns: "
+                 f"{list(df.columns)}")
+
+    print(f"[info] cwd={os.getcwd()}")
+    print(f"[info] csv={os.path.abspath(csv_path)} rows={len(df)}")
+    print(f"[info] out={os.path.abspath(out_root)} data_root={data_root or '<none>'}")
+    if len(df):
+        preview_first_row(df.iloc[0], id_real, data_root)
 
     seen = set()
     n_ok = n_fail = n_pat = 0
@@ -166,13 +242,16 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
             os.makedirs(pdir, exist_ok=True)
 
         for candidates, base, tags in CONTRASTS:
-            src = first_col(row, candidates)
+            src, raw, tried = resolve_source(row, candidates, data_root)
             out_path = os.path.join(pdir, base + ".nii.gz")
 
+            if not raw:
+                continue  # contrast column empty/absent for this patient
             if not src:
-                continue  # contrast not provided for this patient
-            if not os.path.exists(src):
-                print(f"[skip] {anon}/{base}: source not found")
+                # Show the value read and everything tried, so the operator can
+                # tell whether the cell is a path, a relative name, or a flag.
+                print(f"[skip] {anon}/{base}: source not found | value={raw!r} "
+                      f"tried={tried}")
                 n_fail += 1
                 continue
             if os.path.exists(out_path) and not overwrite:
@@ -181,7 +260,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                 continue
 
             if dry_run:
-                print(f"[dry ] {anon}/{base} <- DICOM")
+                print(f"[dry ] {anon}/{base} <- {src}")
                 n_ok += 1
                 continue
 
@@ -207,6 +286,9 @@ def main() -> int:
     ap.add_argument("--csv", required=True, help="cohort CSV (doc/fulldataset.md schema)")
     ap.add_argument("--out", default="processed", help="output root (default: processed)")
     ap.add_argument("--id-col", default="AnonymizationID", help="patient id column")
+    ap.add_argument("--data-root", default="",
+                    help="prefix for relative (or re-homed absolute) DICOM paths "
+                         "in the CSV; also joined with synthentic_path")
     ap.add_argument("--require-matched", action="store_true",
                     help="only convert rows whose match_status is a valid match")
     ap.add_argument("--overwrite", action="store_true",
@@ -219,7 +301,7 @@ def main() -> int:
         sys.exit(f"[error] CSV not found: {args.csv}")
 
     return run(args.csv, args.out, args.id_col, args.require_matched,
-               args.overwrite, args.dry_run)
+               args.overwrite, args.dry_run, args.data_root)
 
 
 if __name__ == "__main__":

@@ -338,7 +338,14 @@ function T = readCohortCSV(csvPath, config)
 assert(isfile(csvPath), 'Cohort CSV not found: %s', csvPath);
 
 % 'preserve' keeps headers with spaces/parens, e.g. "Series UID (Ax MAGiC)".
-T = readtable(csvPath, 'VariableNamingRule', 'preserve');
+% Force the AnonymizationID column to text so zero-padded ids (e.g. "000") are
+% preserved and match the processed/<id> folders from the preprocessor.
+opts = detectImportOptions(csvPath, 'VariableNamingRule', 'preserve');
+hitId = find(strcmpi(opts.VariableNames, config.idCol), 1);
+if ~isempty(hitId)
+    opts = setvartype(opts, opts.VariableNames(hitId), 'char');
+end
+T = readtable(csvPath, opts);
 
 assert(any(strcmp(T.Properties.VariableNames, config.idCol)), ...
     'CSV missing required ID column "%s".', config.idCol);

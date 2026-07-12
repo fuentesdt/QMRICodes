@@ -75,7 +75,13 @@ idCol = config.idCol;
 
 foldPath = fullfile(rootDir, 'cv_folds.csv');
 assert(isfile(foldPath), 'Fold manifest cv_folds.csv not found in %s (run training first).', rootDir);
-foldTable = readtable(foldPath, 'VariableNamingRule','preserve');
+% Read AnonymizationID as text so zero-padded ids match the cohort CSV / folders.
+foldOpts = detectImportOptions(foldPath, 'VariableNamingRule','preserve');
+hitFoldId = find(strcmpi(foldOpts.VariableNames, idCol), 1);
+if ~isempty(hitFoldId)
+    foldOpts = setvartype(foldOpts, foldOpts.VariableNames(hitFoldId), 'char');
+end
+foldTable = readtable(foldPath, foldOpts);
 assert(any(strcmp(foldTable.Properties.VariableNames, char(idCol))), ...
     'cv_folds.csv missing "%s" column.', idCol);
 
@@ -410,7 +416,14 @@ function T = readCohortCSV(csvPath, config)
 % Read the anonymized MAGiC cohort CSV (schema: doc/fulldataset.md).
 % PHI-safe: only AnonymizationID + image-path + match_status are touched here.
 assert(isfile(csvPath), 'Cohort CSV not found: %s', csvPath);
-T = readtable(csvPath, 'VariableNamingRule', 'preserve');
+% Force the AnonymizationID column to text so zero-padded ids (e.g. "000") are
+% preserved and match the processed/<id> folders from the preprocessor.
+opts = detectImportOptions(csvPath, 'VariableNamingRule', 'preserve');
+hitId = find(strcmpi(opts.VariableNames, config.idCol), 1);
+if ~isempty(hitId)
+    opts = setvartype(opts, opts.VariableNames(hitId), 'char');
+end
+T = readtable(csvPath, opts);
 assert(any(strcmp(T.Properties.VariableNames, config.idCol)), ...
     'CSV missing required ID column "%s".', config.idCol);
 
