@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Preprocessing output (converted NIfTI cohort; may contain patient imaging)
+processed/
+
+# Pipeline artifacts
+trained_models_*/
+cv_folds.csv

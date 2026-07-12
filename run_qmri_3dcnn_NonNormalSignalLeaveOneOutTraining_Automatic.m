@@ -21,35 +21,40 @@ config.idCol     = "AnonymizationID";    % PHI-safe patient key
 config.numFolds  = 5;                    % K in K-fold CV
 config.seed      = 42;                   % deterministic fold assignment
 
-% Where per-patient prediction/training artifacts may be written. Patients are
-% indexed by CSV path, not by a subfolder of rootDir, so give a writable root.
+% Where per-patient prediction/training artifacts may be written.
 config.outRoot   = config.rootDir;
+
+% NIfTI produced by preprocess_dicom_to_nifti.py, organized as
+% <processedRoot>/<AnonymizationID>/{T1W,T2W,FLAIR,PD}.nii.gz. RUN THAT SCRIPT
+% FIRST: it converts the DICOM contrasts and stamps TR/TE/FA/TI into each NIfTI
+% header 'descrip' field, which readAcqParams() reads back below.
+config.processedRoot = fullfile(config.rootDir, 'processed');
 
 % Only keep CSV rows whose match_status marks a valid DICOM<->synthetic match.
 config.requireMatched = true;
 
 % ---- Acquisition parameters (TR/TE/FA/TI) --------------------------------
-% Read per patient from the DICOM header (dicom_path + "Series UID (Ax MAGiC)")
-% by readAcqParams(). The physics forward model (synthSignals) REQUIRES them.
+% Read per patient from the NIfTI header 'descrip' (stamped by the preprocessor)
+% via readAcqParams(). The physics forward model (synthSignals) REQUIRES them.
 % config.acq is an OPTIONAL fallback [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR
-% TIFLAIR]: any positive entry is used only when the DICOM header lacks that tag.
-% Leave as zeros to require every value to come from DICOM (fail fast otherwise).
+% TIFLAIR]: any positive entry is used only when the header lacks that tag.
 config.acq = [   0,    0,    0,     0,    0,      0,       0,       0 ];   % optional fallback
 
 % ---- Reference quantitative maps -----------------------------------------
 % true  -> train against PD/T1/T2 reference maps (parameter L1 term active).
 % false -> signal-only training (lamPD/lamT1/lamT2 forced to 0, refs = zeros).
-config.useRefMaps = true;
+% This cohort exports only weighted contrasts (+ PD), so default is signal-only.
+config.useRefMaps = false;
 
-% Fixed filenames looked up inside each row's synthentic_path when the CSV does
-% not carry a direct per-contrast path. Overridden by CSV columns when present.
-config.fileT1w     = "T1W_Synthetic.nii.gz";    % Synthetic T1W signal
-config.fileT2w     = "T2W_Synthetic.nii.gz";    % Synthetic T2W signal
-config.fileFLAIR   = "FLAIR_Synthetic.nii.gz";  % Synthetic FLAIR signal
-config.filePDref   = "pdmap.nii.gz";            % Reference PD map
-config.fileT1ref   = "t1map.nii.gz";            % Reference T1 map
-config.fileT2ref   = "t2map.nii.gz";            % Reference T2 map
-config.fileMask    = "mask.nii.gz";             % Mask of skull-stripped brain (optional)
+% Fixed NIfTI basenames inside <processedRoot>/<AnonymizationID>/ (produced by
+% preprocess_dicom_to_nifti.py). T1map/T2map are only needed if useRefMaps=true.
+config.fileT1w     = "T1W.nii.gz";      % Synthetic T1W signal
+config.fileT2w     = "T2W.nii.gz";      % Synthetic T2W signal
+config.fileFLAIR   = "FLAIR.nii.gz";    % Synthetic FLAIR signal
+config.filePDref   = "PD.nii.gz";       % Reference PD map (from PS Synthetic)
+config.fileT1ref   = "T1map.nii.gz";    % Reference T1 map (optional)
+config.fileT2ref   = "T2map.nii.gz";    % Reference T2 map (optional)
+config.fileMask    = "mask.nii.gz";     % Mask of skull-stripped brain (optional)
 
 %% ===================== 0.1) READ COHORT CSV ======================
 csvPath = fullfile(config.rootDir, config.csvName);
@@ -358,45 +363,41 @@ end
 
 
 function paths = resolvePatientFiles(row, config)
-% Resolve absolute file paths for one patient's contrasts + reference maps.
-% Strategy per file: use a direct per-contrast path column from the CSV when
-% present/non-empty; otherwise look for a fixed filename inside synthentic_path.
-baseDir = firstNonEmpty(row, ["synthentic_path","synthetic_path","dicom_path"]);
+% Resolve one patient's NIfTI paths under <processedRoot>/<AnonymizationID>/
+% (produced by preprocess_dicom_to_nifti.py). Missing files keep their canonical
+% path so requireFile() can report them by AnonymizationID.
+pid  = canonId(row.(config.idCol));
+pdir = fullfile(char(config.processedRoot), char(pid));
 
-paths.T1w   = pickPath(row, ["T1W Synthetic","T1W_Synthetic","T1W"],     baseDir, config.fileT1w);
-paths.T2w   = pickPath(row, ["T2W Synthetic","T2W_Synthetic","T2W"],     baseDir, config.fileT2w);
-paths.FLAIR = pickPath(row, ["FLAIR Synthetic","FLAIR_Synthetic","FLAIR"], baseDir, config.fileFLAIR);
-
-% Reference quant maps. "PS Synthetic" is treated as the PD/proton-density map.
-paths.PDref = pickPath(row, ["PS Synthetic","PD Synthetic","PDref","PS_Synthetic"], baseDir, config.filePDref);
-paths.T1ref = pickPath(row, ["T1 Map","T1map","T1ref"],  baseDir, config.fileT1ref);
-paths.T2ref = pickPath(row, ["T2 Map","T2map","T2ref"],  baseDir, config.fileT2ref);
-
-% Mask is optional (empty string if not found).
-paths.mask  = pickPath(row, ["mask","Mask"], baseDir, config.fileMask, true);
+paths.T1w   = underProcessed(pdir, config.fileT1w);
+paths.T2w   = underProcessed(pdir, config.fileT2w);
+paths.FLAIR = underProcessed(pdir, config.fileFLAIR);
+paths.PDref = underProcessed(pdir, config.filePDref);
+paths.T1ref = underProcessed(pdir, config.fileT1ref);
+paths.T2ref = underProcessed(pdir, config.fileT2ref);
+paths.mask  = underProcessed(pdir, config.fileMask);
 end
 
 
-function p = pickPath(row, colCandidates, baseDir, fixedName, optional)
-% Resolve one file path: prefer a CSV column value; else baseDir/fixedName.
-% Tries both the given name and its .nii/.nii.gz variant.
-if nargin < 5, optional = false; end
-p = '';
-
-% 1) direct path from a CSV column
-v = firstNonEmpty(row, colCandidates);
-if strlength(v) > 0
-    cand = resolveExt(char(v));
-    if ~isempty(cand), p = cand; return; end
-    p = char(v);   % return as-is; requireFile will report if missing
-    return;
+function p = underProcessed(pdir, name)
+% Existing file at pdir/name (trying .nii/.nii.gz); else the canonical path.
+p = resolveExt(fullfile(pdir, char(name)));
+if isempty(p), p = fullfile(pdir, char(name)); end
 end
 
-% 2) fixed filename inside baseDir
-if strlength(string(baseDir)) > 0
-    cand = resolveExt(fullfile(char(baseDir), char(fixedName)));
-    if ~isempty(cand), p = cand; return; end
-    if ~optional, p = fullfile(char(baseDir), char(fixedName)); end
+
+function s = canonId(v)
+% Canonical AnonymizationID string matching the Python 'processed/<id>' folders:
+% integer-valued IDs render without a decimal (0 -> "0", 5 -> "5").
+if iscell(v), v = v{1}; end
+if isnumeric(v)
+    if isscalar(v) && v == floor(v)
+        s = string(int64(v));
+    else
+        s = string(v);
+    end
+else
+    s = strtrim(string(v));
 end
 end
 
@@ -416,22 +417,6 @@ end
 end
 
 
-function v = firstNonEmpty(row, colCandidates)
-% First non-empty string value among candidate column names (case-insensitive).
-v = "";
-for i = 1:numel(colCandidates)
-    name = matchVar(row, colCandidates(i));
-    if strlength(name) == 0, continue; end
-    val = row.(name);
-    if iscell(val), val = val{1}; end
-    val = strtrim(string(val));
-    if strlength(val) > 0 && ~ismember(lower(val), ["nan","na","<missing>"])
-        v = val; return;
-    end
-end
-end
-
-
 function name = matchVar(T, candidate)
 % Case-insensitive lookup of a single column name; "" if absent.
 name = "";
@@ -441,140 +426,61 @@ end
 
 
 function acq = readAcqParams(row, config)
-% Read the MAGiC acquisition parameters from DICOM headers for one patient.
-% Returns [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR TIFLAIR] with FA in
-% DEGREES (callers convert to radians). PHI-safe: only numeric MR timing tags are
-% ever read out of the header; the header struct is never logged or persisted.
-%
-% Source: the Ax MAGiC acquisition series (dicom_path, matched by
-% "Series UID (Ax MAGiC)"). If a synthetic-contrast column points at its own
-% DICOM, that contrast's header is used instead (its synthesis TR/TE/FA/TI).
-% Missing tags fall back to a positive config.acq(k); otherwise -> fail fast.
+% Read the MAGiC acquisition parameters for one patient from the NIfTI header
+% 'descrip' fields stamped by preprocess_dicom_to_nifti.py. Returns
+% [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR TIFLAIR] with FA in DEGREES
+% (callers convert to radians). config.acq positive entries are the fallback for
+% any tag a header lacks; unresolved values -> fail fast (AnonymizationID only).
+pid  = canonId(row.(config.idCol));
+pdir = fullfile(char(config.processedRoot), char(pid));
 
-dcmPath   = firstNonEmpty(row, ["dicom_path"]);
-seriesUID = firstNonEmpty(row, ["Series UID (Ax MAGiC)","Series UID","SeriesUID","Series_UID"]);
-baseInfo  = readDicomHeader(dcmPath, seriesUID);
-
-t1Info = pickContrastHeader(row, ["T1W Synthetic","T1W_Synthetic","T1W"],       baseInfo);
-t2Info = pickContrastHeader(row, ["T2W Synthetic","T2W_Synthetic","T2W"],       baseInfo);
-flInfo = pickContrastHeader(row, ["FLAIR Synthetic","FLAIR_Synthetic","FLAIR"], baseInfo);
+d1 = niiDescrip(underProcessed(pdir, config.fileT1w));    % TR;TE;FA
+d2 = niiDescrip(underProcessed(pdir, config.fileT2w));    % TR;TE
+d3 = niiDescrip(underProcessed(pdir, config.fileFLAIR));  % TR;TE;TI
 
 fb = zeros(1,8);
 if isfield(config,'acq') && numel(config.acq)==8, fb = double(config.acq(:)'); end
 
 acq    = zeros(1,8);
-acq(1) = dicomNum(t1Info,'RepetitionTime', fb(1));
-acq(2) = dicomNum(t1Info,'EchoTime',       fb(2));
-acq(3) = dicomNum(t1Info,'FlipAngle',      fb(3));
-acq(4) = dicomNum(t2Info,'RepetitionTime', fb(4));
-acq(5) = dicomNum(t2Info,'EchoTime',       fb(5));
-acq(6) = dicomNum(flInfo,'RepetitionTime', fb(6));
-acq(7) = dicomNum(flInfo,'EchoTime',       fb(7));
-acq(8) = dicomNum(flInfo,'InversionTime',  fb(8));
+acq(1) = parseTag(d1, 'TR', fb(1));
+acq(2) = parseTag(d1, 'TE', fb(2));
+acq(3) = parseTag(d1, 'FA', fb(3));
+acq(4) = parseTag(d2, 'TR', fb(4));
+acq(5) = parseTag(d2, 'TE', fb(5));
+acq(6) = parseTag(d3, 'TR', fb(6));
+acq(7) = parseTag(d3, 'TE', fb(7));
+acq(8) = parseTag(d3, 'TI', fb(8));
 
 miss = find(~(acq > 0));
 if ~isempty(miss)
-    names  = ["TRT1","TET1","FAT1_deg","TRT2","TET2","TRFLAIR","TEFLAIR","TIFLAIR"];
-    anonID = string(row.(config.idCol));
-    if iscell(anonID), anonID = string(anonID{1}); end
+    names = ["TRT1","TET1","FAT1_deg","TRT2","TET2","TRFLAIR","TEFLAIR","TIFLAIR"];
     error('qMRI:AcqParam', ...
-        'Could not resolve acquisition parameter(s) %s from DICOM for patient %s.', ...
-        strjoin(cellstr(names(miss)), ', '), anonID(1));
+        'Could not resolve acquisition parameter(s) %s from NIfTI header for patient %s.', ...
+        strjoin(cellstr(names(miss)), ', '), pid);
 end
 end
 
 
-function info = readDicomHeader(pathIn, seriesUID)
-% dicominfo for a representative slice of the target series; [] if unavailable.
-% Reuses the repo's dir('*.dcm')/dicominfo idiom (see dicomLoaderAndViewer.m).
-info = [];
-if strlength(string(pathIn)) == 0, return; end
-p = char(pathIn);
-
-if isfolder(p)
-    files = dir(fullfile(p, '*.dcm'));
-    if isempty(files)
-        all = dir(fullfile(p, '*'));            % some exports drop the .dcm extension
-        files = all(~[all.isdir]);
-    end
-    if isempty(files), return; end
-    % Prefer a file whose SeriesInstanceUID matches the requested series.
-    for i = 1:numel(files)
-        fp = fullfile(files(i).folder, files(i).name);
-        try, hdr = dicominfo(fp); catch, continue; end
-        if strlength(string(seriesUID)) == 0 || ...
-                (isfield(hdr,'SeriesInstanceUID') && strcmp(hdr.SeriesInstanceUID, char(seriesUID)))
-            info = hdr; return;
-        end
-    end
-    % No UID match -> first readable header.
-    for i = 1:numel(files)
-        try, info = dicominfo(fullfile(files(i).folder, files(i).name)); return; catch, end
-    end
-elseif isfile(p)
-    try, info = dicominfo(p); catch, info = []; end
+function s = niiDescrip(f)
+% NIfTI header 'descrip' string (MATLAB exposes it as info.Description); "" if
+% the file is missing or unreadable.
+s = "";
+if isfile(f)
+    try, info = niftiinfo(f); s = string(info.Description); catch, end
 end
 end
 
 
-function info = pickContrastHeader(row, cols, fallbackInfo)
-% If a contrast column points at a DICOM (not a NIfTI), read its header;
-% otherwise reuse fallbackInfo (the Ax MAGiC acquisition header).
-info = fallbackInfo;
-v = firstNonEmpty(row, cols);
-if strlength(v) == 0, return; end
-p = char(v);
-isNii = endsWith(lower(p), ".nii") || endsWith(lower(p), ".nii.gz") || endsWith(lower(p), ".gz");
-if isNii, return; end
-if isfolder(p) || isfile(p)
-    hdr = readDicomHeader(p, "");
-    if ~isempty(hdr), info = hdr; end
-end
-end
-
-
-function v = dicomNum(info, field, fallback)
-% Numeric MR timing tag from a dicominfo struct (checks top-level and the
-% enhanced-DICOM shared functional groups). Uses fallback (>0) if not found.
+function v = parseTag(descrip, key, fallback)
+% Parse "<key>=<number>" out of a 'TR=..;TE=..;FA=..;TI=..' descrip string.
+% Falls back to a positive fallback value when the key is absent.
 v = 0;
-raw = dicomTag(info, field);
-if ~isempty(raw) && isnumeric(raw) && isfinite(raw(1)), v = double(raw(1)); end
+if strlength(descrip) > 0
+    tok = regexp(descrip, key + "\s*=\s*([-\d.eE+]+)", 'tokens', 'once');
+    if ~isempty(tok), v = str2double(tok{1}); end
+end
 if ~(v > 0) && nargin >= 3 && ~isempty(fallback) && fallback > 0
     v = double(fallback);
-end
-end
-
-
-function raw = dicomTag(info, field)
-% Look up a tag at the top level, else in the enhanced-DICOM
-% SharedFunctionalGroupsSequence (MR Timing / Echo / Modifier sequences).
-raw = [];
-if isempty(info) || ~isstruct(info), return; end
-if isfield(info, field) && ~isempty(info.(field)), raw = info.(field); return; end
-
-if isfield(info, 'SharedFunctionalGroupsSequence')
-    sfg = info.SharedFunctionalGroupsSequence;
-    if isstruct(sfg)
-        items = struct2cell(sfg);              % Item_1, Item_2, ...
-        groups = {'MRTimingAndRelatedParametersSequence', ...
-                  'MREchoSequence', 'MRModifierSequence', ...
-                  'MRImagingModifierSequence'};
-        for a = 1:numel(items)
-            it = items{a};
-            if ~isstruct(it), continue; end
-            for g = 1:numel(groups)
-                if isfield(it, groups{g})
-                    gc = struct2cell(it.(groups{g}));
-                    for b = 1:numel(gc)
-                        sub = gc{b};
-                        if isstruct(sub) && isfield(sub, field) && ~isempty(sub.(field))
-                            raw = sub.(field); return;
-                        end
-                    end
-                end
-            end
-        end
-    end
 end
 end
 

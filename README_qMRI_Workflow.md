@@ -136,14 +136,23 @@ The two recommended scripts now run 5-fold cross-validation over the anonymized
 MAGiC cohort indexed by a CSV (schema in doc/fulldataset.md), instead of LOPO
 over acq_params.xlsx. Patients are grouped by AnonymizationID into 5 folds.
 
-Acquisition parameters (TR/TE/FA/TI) are read per patient directly from the
-DICOM header via readAcqParams(), using the CSV's dicom_path and
-"Series UID (Ax MAGiC)" columns (RepetitionTime/EchoTime/FlipAngle/InversionTime).
+The synthetic contrasts in the CSV (T1W/T2W/FLAIR/PS Synthetic) are DICOM series,
+so a Python/SimpleITK preprocessing step converts them to NIfTI first.
+
+Acquisition parameters (TR/TE/FA/TI) are read per patient from the NIfTI header
+'descrip' field (MATLAB niftiinfo().Description), which the preprocessor stamps
+from each contrast's DICOM (RepetitionTime/EchoTime/FlipAngle/InversionTime).
 config.acq is only an optional fallback for tags a header happens to lack.
 
-Before running, edit the CONFIG block at the top of each script:
+0. Preprocess (run once, before MATLAB), converts DICOM -> processed/<id>/*.nii.gz
+   and stamps the acq tags into each NIfTI header:
+     python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
+   Add --require-matched to convert only rows with a valid match_status.
+
+Before running the MATLAB scripts, edit the CONFIG block at the top of each:
 - config.csvName : cohort CSV filename in the root folder (default dataset.csv)
-- config.useRefMaps : true if PD/T1/T2 reference maps exist; false = signal-only
+- config.processedRoot : preprocessor output (default <rootDir>/processed)
+- config.useRefMaps : false = signal-only (default; cohort has no T1/T2 maps)
 - config.requireMatched : keep only rows with a valid match_status
 - config.outRoot : where per-patient outputs are written
 
