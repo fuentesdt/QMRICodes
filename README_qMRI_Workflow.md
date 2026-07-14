@@ -176,9 +176,12 @@ Then invoke the preprocessor with that interpreter, e.g.
    Optional brain masks (skull-strip): the MATLAB pipeline confines training
    patches + loss + CCC to a brain mask (mask.nii.gz); without one it falls back to
    nonzero-T1W. Generate proper masks with HD-BET (install: pip install HD-BET),
-   run after conversion, before MATLAB:
-     /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --device cpu
-   It writes processed/<id>/mask.nii.gz on the T1W grid.
+   run after conversion, before MATLAB. HD-BET is a PyTorch model and uses the GPU
+   by default when CUDA is available (seconds/case vs minutes on CPU); the device
+   is auto-selected. It writes processed/<id>/mask.nii.gz on the T1W grid.
+     /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed            # auto GPU/CPU
+     /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --device 0 # force GPU 0
+     /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --fast     # ~8x faster
 
    PHI: the preprocessor HIDES literal file paths in its diagnostics by default
    (the dataset.csv path columns can embed PHI). Its default output is safe to
