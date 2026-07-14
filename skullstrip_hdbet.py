@@ -39,6 +39,19 @@ import sys
 import tempfile
 
 
+def find_hdbet_exe() -> str:
+    """Locate the hd-bet console script. Checks next to the running interpreter
+    first (its own venv bin -- pip installs the entry point there), then PATH. This
+    matters when the script is launched via a full path to python without the venv
+    activated, so /opt/<venv>/bin is not on PATH."""
+    here = os.path.dirname(os.path.abspath(sys.executable))
+    for name in ("hd-bet", "hd-bet.exe"):
+        cand = os.path.join(here, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return shutil.which("hd-bet") or ""
+
+
 def default_device() -> str:
     """Pick GPU index '0' when CUDA is available, else 'cpu'. Uses '0' (not 'cuda')
     because both HD-BET v1 (integer index) and v2 accept an integer device."""
@@ -62,7 +75,7 @@ def find_mask(search_dir: str) -> str:
     return ""
 
 
-def run_hdbet(t1w: str, out_dir: str, device: str, fast: bool) -> str:
+def run_hdbet(exe: str, t1w: str, out_dir: str, device: str, fast: bool) -> str:
     """Run HD-BET on t1w into out_dir; return the produced brain-mask path.
 
     Tries HD-BET v2 then v1 command forms (their CLIs differ) until one succeeds and
@@ -70,18 +83,28 @@ def run_hdbet(t1w: str, out_dir: str, device: str, fast: bool) -> str:
     test-time augmentation (v2 --disable_tta / v1 -tta 0 -mode fast) for ~8x speed.
     """
     out = os.path.join(out_dir, "brain.nii.gz")
-    dev = ["-device", device] if device else []
+    env = os.environ.copy()
+    # HD-BET v2 uses torch.device(), which rejects a bare index like "1"; select a
+    # specific GPU via CUDA_VISIBLE_DEVICES and address it as the (remapped) first
+    # visible device. 'cpu'/'cuda[:N]' are passed through unchanged.
+    if str(device).lower() == "cpu":
+        dev_v2 = dev_v1 = "cpu"
+    elif str(device).lower().startswith("cuda"):
+        dev_v2, dev_v1 = device, "0"
+    else:  # bare integer index
+        env["CUDA_VISIBLE_DEVICES"] = str(device)
+        dev_v2, dev_v1 = "cuda", "0"
     v2_speed = ["--disable_tta"] if fast else []
     v1_speed = ["-tta", "0", "-mode", "fast"] if fast else []
     variants = [
-        ["hd-bet", "-i", t1w, "-o", out, *dev, *v2_speed, "--save_bet_mask"],  # v2
-        ["hd-bet", "-i", t1w, "-o", out, *dev, *v1_speed, "-s", "1"],          # v1
-        ["hd-bet", "-i", t1w, "-o", out, *dev],                                # plain
+        [exe, "-i", t1w, "-o", out, "-device", dev_v2, *v2_speed, "--save_bet_mask"],  # v2
+        [exe, "-i", t1w, "-o", out, "-device", dev_v1, *v1_speed, "-s", "1"],          # v1
+        [exe, "-i", t1w, "-o", out, "-device", dev_v2],                                # plain
     ]
     last = None
     for cmd in variants:
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
         except subprocess.CalledProcessError as exc:
             last = exc
             continue
@@ -89,7 +112,8 @@ def run_hdbet(t1w: str, out_dir: str, device: str, fast: bool) -> str:
         if mask:
             return mask
     if last is not None:
-        raise last
+        tail = " | ".join((last.stderr or last.stdout or "").strip().splitlines()[-2:])
+        raise RuntimeError(tail or "hd-bet exited non-zero")
     raise FileNotFoundError("HD-BET produced no mask")
 
 
@@ -119,9 +143,12 @@ def main() -> int:
 
     if not os.path.isdir(args.processed):
         sys.exit(f"[error] no such dir: {args.processed}")
-    if shutil.which("hd-bet") is None:
-        sys.exit("[error] 'hd-bet' not found on PATH. Install with: pip install HD-BET "
-                 "(https://github.com/MIC-DKFZ/HD-BET)")
+    exe = find_hdbet_exe()
+    if not exe:
+        sys.exit("[error] 'hd-bet' not found next to this interpreter "
+                 f"({os.path.dirname(sys.executable)}) or on PATH. Install into the "
+                 "same env: pip install HD-BET (https://github.com/MIC-DKFZ/HD-BET)")
+    print(f"[info] hd-bet: {exe}")
 
     ids = args.ids or sorted(d for d in os.listdir(args.processed)
                              if os.path.isdir(os.path.join(args.processed, d)))
@@ -143,14 +170,15 @@ def main() -> int:
 
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                produced = run_hdbet(t1w, tmp, device, args.fast)
+                produced = run_hdbet(exe, t1w, tmp, device, args.fast)
                 if not produced or not os.path.isfile(produced):
                     raise FileNotFoundError("HD-BET produced no mask")
                 shutil.move(produced, mask)
             print(f"[ok  ] {anon}: mask.nii.gz")
             n_ok += 1
         except Exception as exc:  # never abort the whole cohort
-            print(f"[fail] {anon}: {type(exc).__name__}")
+            reason = str(exc).strip().replace("\n", " ")
+            print(f"[fail] {anon}: {reason[:300] or type(exc).__name__}")
             n_fail += 1
 
     print(f"[done] masked={n_ok} skipped/kept={n_skip} failed={n_fail}")
