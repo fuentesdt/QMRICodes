@@ -159,6 +159,13 @@ Then invoke the preprocessor with that interpreter, e.g.
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
    Add --require-matched to convert only rows with a valid match_status.
 
+   If the SYMAPS maps and the weighted contrasts were exported on different voxel
+   grids (MATLAB will error "Size mismatch ..."), add --resample. It mirrors each
+   patient onto the T1W input grid in a SEPARATE directory (default
+   processed_resampled/): volumes whose grid differs are linearly resampled, the
+   rest are copied. Then set config.processedRoot to that *_resampled directory.
+     /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed --resample
+
 Before running the MATLAB scripts, edit the CONFIG block at the top of each:
 - config.csvName : cohort CSV filename in the root folder (default dataset.csv)
 - config.processedRoot : preprocessor output (default <rootDir>/processed)

@@ -196,7 +196,8 @@ for f = 1:config.numFolds
         end
 
         assert(isequal(size(S1),size(S2),size(S3),size(PD),size(T1),size(T2),size(M)), ...
-            'Size mismatch for %s', P.id);
+            ['Size mismatch for %s. Re-run preprocess_dicom_to_nifti.py with ', ...
+             '--resample and point config.processedRoot at the *_resampled dir.'], P.id);
 
         % Build patches
         patches = extractPatches3D(S1,S2,S3,PD,T1,T2,M,config.patchSize,config.patchStride);

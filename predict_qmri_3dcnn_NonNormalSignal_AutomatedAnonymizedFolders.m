@@ -187,7 +187,9 @@ for sel = 1:numel(predictIDs)
         'Input/mask sizes do not match for patient %s.', pid);
 
     assert(isequal(size(S1),size(PDSyMRI),size(T1SyMRI),size(T2SyMRI)), ...
-        'Input/reference qMRI map sizes do not match for patient %s.', pid);
+        ['Input/reference qMRI map sizes do not match for patient %s. Re-run ', ...
+         'preprocess_dicom_to_nifti.py with --resample and point ', ...
+         'config.processedRoot at the *_resampled dir.'], pid);
 
     %% 5) Acquisition parameters (read from DICOM header; FA -> radians)
     acq = readAcqParams(row, config);              % [TR/TE/FA(deg)/TI], 8-vector

@@ -32,6 +32,7 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import sys
 
 import pandas as pd
@@ -228,6 +229,59 @@ def stamp_descrip(nii_path: str, descrip: str) -> None:
     img.to_filename(nii_path)
 
 
+def read_descrip(nii_path: str) -> str:
+    """Read back the NIfTI 'descrip' string (empty if unreadable)."""
+    try:
+        return bytes(nib.load(nii_path).header["descrip"]).split(b"\x00")[0].decode(
+            "ascii", "ignore")
+    except Exception:
+        return ""
+
+
+def _grid(img: sitk.Image):
+    """Geometry signature (size, spacing, origin, direction) for grid comparison."""
+    return (tuple(int(s) for s in img.GetSize()),
+            tuple(round(s, 5) for s in img.GetSpacing()),
+            tuple(round(o, 4) for o in img.GetOrigin()),
+            tuple(round(d, 5) for d in img.GetDirection()))
+
+
+def resample_patient(pdir: str, rpdir: str, ref_base: str = "T1W") -> int:
+    """Mirror one patient's NIfTI set from pdir into rpdir on a common grid.
+
+    The reference grid is ``<ref_base>.nii.gz`` (the weighted-input space the CNN
+    works in). Volumes whose grid already matches are copied verbatim (preserving
+    the acq 'descrip'); volumes on a different grid are linearly resampled onto the
+    reference and the acq 'descrip' is re-stamped. Returns the number of volumes
+    resampled, or -1 if the reference is missing.
+    """
+    ref_path = os.path.join(pdir, ref_base + ".nii.gz")
+    if not os.path.isfile(ref_path):
+        print(f"[warn] {os.path.basename(pdir)}: no {ref_base}.nii.gz; skip resample")
+        return -1
+    ref = sitk.ReadImage(ref_path)
+    ref_sig = _grid(ref)
+    os.makedirs(rpdir, exist_ok=True)
+
+    n_res = 0
+    for fn in sorted(os.listdir(pdir)):
+        if not fn.endswith(".nii.gz"):
+            continue
+        src = os.path.join(pdir, fn)
+        dst = os.path.join(rpdir, fn)
+        img = sitk.ReadImage(src)
+        if _grid(img) == ref_sig:
+            shutil.copyfile(src, dst)                 # identical grid -> copy as-is
+        else:
+            out = sitk.Resample(img, ref, sitk.Transform(), sitk.sitkLinear,
+                                0.0, img.GetPixelIDValue())
+            sitk.WriteImage(out, dst)
+            stamp_descrip(dst, read_descrip(src))     # resampling drops descrip
+            n_res += 1
+            print(f"[resamp] {os.path.basename(pdir)}/{fn} -> {ref_base} grid")
+    return n_res
+
+
 def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
     """Print the path-like column values for the first patient so the operator can
     see what the contrast columns actually contain (path? flag? relative name?)."""
@@ -263,7 +317,8 @@ def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
 
 
 def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
-        overwrite: bool, dry_run: bool, data_root: str) -> int:
+        overwrite: bool, dry_run: bool, data_root: str,
+        resample: bool, resampled_out: str) -> int:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 
     # Resolve the id column case-insensitively.
@@ -276,11 +331,14 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
     print(f"[info] cwd={os.getcwd()}")
     print(f"[info] csv={os.path.abspath(csv_path)} rows={len(df)}")
     print(f"[info] out={os.path.abspath(out_root)} data_root={data_root or '<none>'}")
+    if resample:
+        print(f"[info] resample=on -> {os.path.abspath(resampled_out)} "
+              f"(reference grid: T1W)")
     if len(df):
         preview_first_row(df.iloc[0], id_real, data_root)
 
     seen = set()
-    n_ok = n_fail = n_pat = 0
+    n_ok = n_fail = n_pat = n_resampled = 0
     for _, row in df.iterrows():
         anon = str(row[id_real]).strip()
         if not anon or anon.lower() in ("nan", "na", "none"):
@@ -358,7 +416,18 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                     print(f"[fail] {anon}/{base}: {type(exc).__name__}: {exc}")
                     n_fail += 1
 
-    print(f"[done] patients={n_pat} converted/kept={n_ok} failed/skipped={n_fail}")
+        # Resample to a common grid (weighted-input space) into a separate dir,
+        # so MATLAB's size-equality check passes when SYMAPS maps and weighted
+        # contrasts were exported on different grids.
+        if resample and not dry_run:
+            n = resample_patient(pdir, os.path.join(resampled_out, anon))
+            if n > 0:
+                n_resampled += 1
+
+    print(f"[done] patients={n_pat} converted/kept={n_ok} failed/skipped={n_fail}"
+          + (f" resampled_patients={n_resampled}" if resample else ""))
+    if resample:
+        print(f"[done] point MATLAB config.processedRoot at {os.path.abspath(resampled_out)}")
     return 0 if n_fail == 0 else 1
 
 
@@ -377,13 +446,24 @@ def main() -> int:
                     help="re-convert even if the output NIfTI already exists")
     ap.add_argument("--dry-run", action="store_true",
                     help="list intended conversions without reading pixel data")
+    ap.add_argument("--resample", action="store_true",
+                    help="mirror each patient onto a common grid (the T1W input "
+                         "space) into a separate directory; volumes whose grid "
+                         "differs are linearly resampled, others copied")
+    ap.add_argument("--resampled-out", default="",
+                    help="destination for --resample (default: <out>_resampled)")
     args = ap.parse_args()
 
     if not os.path.isfile(args.csv):
         sys.exit(f"[error] CSV not found: {args.csv}")
 
+    resampled_out = args.resampled_out
+    if args.resample and not resampled_out:
+        resampled_out = args.out.rstrip("/\\") + "_resampled"
+
     return run(args.csv, args.out, args.id_col, args.require_matched,
-               args.overwrite, args.dry_run, args.data_root)
+               args.overwrite, args.dry_run, args.data_root,
+               args.resample, resampled_out)
 
 
 if __name__ == "__main__":
