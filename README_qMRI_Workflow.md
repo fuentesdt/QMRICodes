@@ -178,7 +178,9 @@ Then invoke the preprocessor with that interpreter, e.g.
    nonzero-T1W. Generate proper masks with HD-BET (install: pip install HD-BET),
    run after conversion, before MATLAB. HD-BET is a PyTorch model and uses the GPU
    by default when CUDA is available (seconds/case vs minutes on CPU); the device
-   is auto-selected. It writes processed/<id>/mask.nii.gz on the T1W grid.
+   is auto-selected. It streams HD-BET's live output and a [k/N] per-patient
+   progress counter (--quiet for progress lines only). It writes
+   processed/<id>/mask.nii.gz on the T1W grid.
      /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed            # auto GPU/CPU
      /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --device 0 # force GPU 0
      /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --fast     # ~8x faster

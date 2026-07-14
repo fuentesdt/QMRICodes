@@ -75,12 +75,15 @@ def find_mask(search_dir: str) -> str:
     return ""
 
 
-def run_hdbet(exe: str, t1w: str, out_dir: str, device: str, fast: bool) -> str:
+def run_hdbet(exe: str, t1w: str, out_dir: str, device: str, fast: bool,
+              capture: bool = False) -> str:
     """Run HD-BET on t1w into out_dir; return the produced brain-mask path.
 
     Tries HD-BET v2 then v1 command forms (their CLIs differ) until one succeeds and
     a mask is found. `device` is a GPU index ('0') or 'cpu'; `fast` disables
     test-time augmentation (v2 --disable_tta / v1 -tta 0 -mode fast) for ~8x speed.
+    `capture=False` (default) streams HD-BET's own progress to the console;
+    `capture=True` hides it and only surfaces the stderr tail on failure.
     """
     out = os.path.join(out_dir, "brain.nii.gz")
     env = os.environ.copy()
@@ -104,7 +107,10 @@ def run_hdbet(exe: str, t1w: str, out_dir: str, device: str, fast: bool) -> str:
     last = None
     for cmd in variants:
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+            if capture:
+                subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+            else:
+                subprocess.run(cmd, check=True, env=env)  # stream to console
         except subprocess.CalledProcessError as exc:
             last = exc
             continue
@@ -112,8 +118,9 @@ def run_hdbet(exe: str, t1w: str, out_dir: str, device: str, fast: bool) -> str:
         if mask:
             return mask
     if last is not None:
-        tail = " | ".join((last.stderr or last.stdout or "").strip().splitlines()[-2:])
-        raise RuntimeError(tail or "hd-bet exited non-zero")
+        tail = " | ".join((getattr(last, "stderr", "") or getattr(last, "stdout", "")
+                           or "").strip().splitlines()[-2:])
+        raise RuntimeError(tail or "hd-bet exited non-zero (see output above)")
     raise FileNotFoundError("HD-BET produced no mask")
 
 
@@ -134,6 +141,9 @@ def main() -> int:
                     help="re-run even if mask.nii.gz already exists")
     ap.add_argument("--ids", nargs="*", default=None,
                     help="only these AnonymizationIDs (default: all subdirs)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="capture HD-BET's own output instead of streaming it "
+                         "(default: stream so you see live progress)")
     args = ap.parse_args()
 
     device = args.device or default_device()
@@ -152,36 +162,47 @@ def main() -> int:
 
     ids = args.ids or sorted(d for d in os.listdir(args.processed)
                              if os.path.isdir(os.path.join(args.processed, d)))
+    total = len(ids)
+    print(f"[info] {total} patient(s) to process"
+          + ("" if args.fast else "  (add --fast for ~8x speedup)"))
+    if not args.quiet:
+        print("[info] streaming HD-BET output below; --quiet to suppress")
 
     n_ok = n_skip = n_fail = 0
-    for anon in ids:
+    for k, anon in enumerate(ids, 1):
+        remaining = total - k
         pdir = os.path.join(args.processed, anon)
         t1w = os.path.join(pdir, args.main + ".nii.gz")
         mask = os.path.join(pdir, "mask.nii.gz")
 
         if not os.path.isfile(t1w):
-            print(f"[skip] {anon}: no {args.main}.nii.gz")
+            print(f"[{k}/{total}] {anon}: SKIP (no {args.main}.nii.gz)", flush=True)
             n_skip += 1
             continue
         if os.path.isfile(mask) and not args.overwrite:
-            print(f"[keep] {anon}: mask.nii.gz exists")
+            print(f"[{k}/{total}] {anon}: KEEP (mask exists)", flush=True)
             n_skip += 1
             continue
 
+        print(f"[{k}/{total}] {anon}: skull-stripping on device {device}"
+              f" ... ({remaining} left after this)", flush=True)
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                produced = run_hdbet(exe, t1w, tmp, device, args.fast)
+                produced = run_hdbet(exe, t1w, tmp, device, args.fast,
+                                     capture=args.quiet)
                 if not produced or not os.path.isfile(produced):
                     raise FileNotFoundError("HD-BET produced no mask")
                 shutil.move(produced, mask)
-            print(f"[ok  ] {anon}: mask.nii.gz")
+            print(f"[{k}/{total}] {anon}: OK -> mask.nii.gz  "
+                  f"(done {n_ok + 1}, {remaining} left)", flush=True)
             n_ok += 1
         except Exception as exc:  # never abort the whole cohort
             reason = str(exc).strip().replace("\n", " ")
-            print(f"[fail] {anon}: {reason[:300] or type(exc).__name__}")
+            print(f"[{k}/{total}] {anon}: FAIL -- {reason[:300] or type(exc).__name__}",
+                  flush=True)
             n_fail += 1
 
-    print(f"[done] masked={n_ok} skipped/kept={n_skip} failed={n_fail}")
+    print(f"[done] masked={n_ok} skipped/kept={n_skip} failed={n_fail} of {total}")
     return 0 if n_fail == 0 else 1
 
 
