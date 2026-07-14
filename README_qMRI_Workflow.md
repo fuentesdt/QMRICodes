@@ -141,7 +141,7 @@ converts them to NIfTI under processed/<AnonymizationID>/ first:
 - T1W/T2W/FLAIR Synthetic : one DICOM series each -> T1W/T2W/FLAIR.nii.gz
 - SYMAPS : a directory of per-slice DICOM files named SYMAPS_<NN>_{T1,T2,PD}.dcm,
   split by suffix into the quantitative reference maps T1map/T2map/PD.nii.gz
-- PS Synthetic (if present) : converted to PS.nii.gz (not used by the pipeline)
+- PS Synthetic : ignored (phase-sensitive contrast; not a CNN input or reference)
 
 Acquisition parameters (TR/TE/FA/TI) are read per patient from the NIfTI header
 'descrip' field (MATLAB niftiinfo().Description), which the preprocessor stamps

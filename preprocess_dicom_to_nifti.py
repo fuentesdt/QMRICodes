@@ -3,14 +3,15 @@
 
 The cohort CSV (schema in doc/fulldataset.md) indexes, per patient:
   - weighted synthetic contrasts, one DICOM series each, in the columns
-    ``T1W Synthetic`` / ``T2W Synthetic`` / ``FLAIR Synthetic`` (and ``PS Synthetic``);
+    ``T1W Synthetic`` / ``T2W Synthetic`` / ``FLAIR Synthetic``;
   - ``SYMAPS``: a directory (under ``synthentic_path``) holding the quantitative
     T1 / T2 / PD maps as per-slice DICOM files named ``SYMAPS_<NN>_{T1,T2,PD}.dcm``.
+The ``PS Synthetic`` (phase-sensitive) column is ignored -- it is not a CNN input
+and not a reference map, so it is not converted.
 
 This script writes NIfTI under ``<out>/<AnonymizationID>/``:
   T1W.nii.gz, T2W.nii.gz, FLAIR.nii.gz            (weighted inputs)
   T1map.nii.gz, T2map.nii.gz, PD.nii.gz           (quantitative references, from SYMAPS)
-  PS.nii.gz                                        (if a PS Synthetic column is present)
 Each weighted NIfTI's ``descrip`` header field is stamped with the pulse-sequence
 acquisition parameters (TR/TE/FA/TI) read from its DICOM, so the MATLAB pipeline
 (readAcqParams) can read them back via niftiinfo().Description.
@@ -43,13 +44,14 @@ import nibabel as nib
 # Weighted contrasts: (candidate CSV column names, output basename, tags to store).
 # Each column is a single DICOM series. Tags map to the physics forward model:
 #   T1w (SPGR/GRE) -> TR, TE, FA ;  T2w (SE) -> TR, TE ;  FLAIR (IR) -> TR, TE, TI
-# PS is a synthetic weighted contrast (not the PD map); stored for completeness.
+# The "PS Synthetic" (phase-sensitive) contrast is intentionally NOT converted:
+# it is neither a CNN input (inputs are T1W/T2W/FLAIR) nor a reference map
+# (PD/T1/T2 come from SYMAPS). Add it back here only if a later model needs it.
 # ----------------------------------------------------------------------------
 CONTRASTS = [
     (["T1W Synthetic", "T1W_Synthetic", "T1W"],       "T1W",   ["TR", "TE", "FA"]),
     (["T2W Synthetic", "T2W_Synthetic", "T2W"],       "T2W",   ["TR", "TE"]),
     (["FLAIR Synthetic", "FLAIR_Synthetic", "FLAIR"], "FLAIR", ["TR", "TE", "TI"]),
-    (["PS Synthetic", "PS_Synthetic"],                "PS",    []),
 ]
 
 # SYMAPS quantitative maps: filename suffix in SYMAPS_<NN>_<suffix>.dcm -> output.
@@ -302,7 +304,6 @@ def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
         ("T2W Synthetic",   ["T2W Synthetic", "T2W_Synthetic", "T2W"]),
         ("FLAIR Synthetic", ["FLAIR Synthetic", "FLAIR_Synthetic", "FLAIR"]),
         ("SYMAPS",          SYMAPS_COLS),
-        ("PS Synthetic",    ["PS Synthetic", "PS_Synthetic"]),
     ):
         resolved, raw, _ = resolve_source(row, cands, data_root)
         if raw == "":
