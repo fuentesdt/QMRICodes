@@ -129,14 +129,56 @@ CORE PROCESS (COMMON)
 - Save outputs and metrics
 
 --------------------------------------------------
-RECOMMENDED WORKFLOW
+RECOMMENDED WORKFLOW (5-fold CV on the anonymized CSV cohort)
 --------------------------------------------------
 
+The two recommended scripts now run 5-fold cross-validation over the anonymized
+MAGiC cohort indexed by a CSV (schema in doc/fulldataset.md), instead of LOPO
+over acq_params.xlsx. Patients are grouped by AnonymizationID into 5 folds.
+
+The synthetic contrasts in the CSV (T1W/T2W/FLAIR/PS Synthetic) are DICOM series,
+so a Python/SimpleITK preprocessing step converts them to NIfTI first.
+
+Acquisition parameters (TR/TE/FA/TI) are read per patient from the NIfTI header
+'descrip' field (MATLAB niftiinfo().Description), which the preprocessor stamps
+from each contrast's DICOM (RepetitionTime/EchoTime/FlipAngle/InversionTime).
+config.acq is only an optional fallback for tags a header happens to lack.
+
+Python setup (one time), for the preprocessing step:
+   python3 -m venv /opt/qmricodes
+   /opt/qmricodes/bin/pip install -r requirements.txt
+Then invoke the preprocessor with that interpreter, e.g.
+   /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py ...
+
+0. Preprocess (run once, before MATLAB), converts DICOM -> processed/<id>/*.nii.gz
+   and stamps the acq tags into each NIfTI header:
+     /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
+   Add --require-matched to convert only rows with a valid match_status.
+
+Before running the MATLAB scripts, edit the CONFIG block at the top of each:
+- config.csvName : cohort CSV filename in the root folder (default dataset.csv)
+- config.processedRoot : preprocessor output (default <rootDir>/processed)
+- config.useRefMaps : false = signal-only (default; cohort has no T1/T2 maps)
+- config.requireMatched : keep only rows with a valid match_status
+- config.outRoot : where per-patient outputs are written
+
 1. Train using:
-   run_qmri_3dcnn_NonNormalSingalLeaveOneOutTraining_Automatic.m
+   run_qmri_3dcnn_NonNormalSignalLeaveOneOutTraining_Automatic.m
+   - Reads config.csvName, assigns 5 folds, writes the PHI-free manifest
+     cv_folds.csv (AnonymizationID,fold), and saves one model per fold in
+     trained_models_Fold1/ ... trained_models_Fold5/.
 
 2. Predict using:
    predict_qmri_3dcnn_NonNormalSignal_AutomatedAnonymizedFolders.m
+   - Select a trained_models_Fold<f> model; the script reads cv_folds.csv and
+     predicts that fold's held-out patients (set config.predictAll=true for all).
+   - Outputs go to <outRoot>/<AnonymizationID>/Fold<f>_Predictions/.
+
+PHI PROTECTION (see ../radpathsandbox/CLAUDE.md):
+Only AnonymizationID is ever printed or used in file/folder names. MRN, Study
+UID, and Series UID are never logged or written. Every required input file is
+gated by requireFile() (fail fast) before it is read. cv_folds.csv contains only
+AnonymizationID and fold number.
 
 --------------------------------------------------
 NOTES

@@ -1,0 +1,6 @@
+# Python dependencies for preprocess_dicom_to_nifti.py (DICOM -> NIfTI).
+# Versions are the ones this pipeline was tested with.
+SimpleITK>=2.5.4
+nibabel>=5.4.2
+pydicom>=3.0.2
+pandas>=2.2
