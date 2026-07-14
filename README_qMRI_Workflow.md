@@ -166,6 +166,16 @@ Then invoke the preprocessor with that interpreter, e.g.
    rest are copied. Then set config.processedRoot to that *_resampled directory.
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed --resample
 
+   PHI: the preprocessor HIDES literal file paths in its diagnostics by default
+   (the dataset.csv path columns can embed PHI). Its default output is safe to
+   paste/share. The --show-paths flag reveals full paths and is ONLY for local
+   debugging -- never paste or commit --show-paths output.
+
+   Inspect a converted patient in ITK-SNAP (T1W as main, the rest as overlays):
+     ./view_patient.sh <AnonymizationID> [processed_dir]     # e.g. ./view_patient.sh 000
+     ./view_patient.sh list                                  # enumerate patients
+   Pass processed_resampled as [processed_dir] to view the resampled set.
+
 Before running the MATLAB scripts, edit the CONFIG block at the top of each:
 - config.csvName : cohort CSV filename in the root folder (default dataset.csv)
 - config.processedRoot : preprocessor output (default <rootDir>/processed)

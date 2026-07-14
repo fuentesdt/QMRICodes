@@ -15,6 +15,23 @@ Recommended end-to-end workflow (see `README_qMRI_Workflow.md`):
 2. Predict: `predict_qmri_3dcnn_NonNormalSignal_AutomatedAnonymizedFolders.m` → writes `<PID>/<savedir>/*_pred.nii.gz`
 3. Figures: `ManuscriptPlotsGenerationCode.m` (run on a server), then `ReopenfigfilesandSave.m` to re-export clean `.fig`/`.png`.
 
+## Current MAGiC CSV cohort: DICOM→NIfTI preprocessing + 5-fold CV
+
+The two **recommended** scripts above now operate in **CSV / 5-fold-CV mode** for the anonymized MAGiC cohort (schema in `doc/fulldataset.md`), not the legacy `acq_params.xlsx` + per-`PatientID`-folder mode described below. The cohort is indexed by `dataset.csv` (key column `AnonymizationID`, e.g. zero-padded `"000"`).
+
+Because the CSV's contrasts/maps are **DICOM**, a Python/SimpleITK step runs **before** MATLAB — `preprocess_dicom_to_nifti.py`:
+- Converts `T1W/T2W/FLAIR Synthetic` (one DICOM series each) → `processed/<AnonymizationID>/{T1W,T2W,FLAIR}.nii.gz`, stamping TR/TE/FA/TI from the DICOM into each NIfTI header `descrip` (MATLAB reads it back via `niftiinfo().Description`; `readAcqParams`).
+- Converts `SYMAPS` (a dir of per-slice `SYMAPS_<NN>_{T1,T2,PD}.dcm`) → `T1map/T2map/PD.nii.gz` (the quantitative references; `RescaleSlope/Intercept` applied).
+- `PS Synthetic` is intentionally **not** converted (phase-sensitive; unused).
+- `--resample` mirrors a patient onto the T1W grid in a **separate** `processed_resampled/` dir when SYMAPS and weighted grids differ (else copies).
+- Setup: `python3 -m venv /opt/qmricodes && /opt/qmricodes/bin/pip install -r requirements.txt`.
+
+MATLAB side (both recommended scripts): read `dataset.csv` (+ PHI-free `cv_folds.csv` manifest), group patients by `AnonymizationID` into 5 folds, models → `trained_models_Fold<f>/`, predictions → `<outRoot>/<AnonymizationID>/Fold<f>_Predictions/`. Set `config.processedRoot` (default `<rootDir>/processed`; point at `processed_resampled/` if you ran `--resample`). Acq params come from the NIfTI `descrip`, not the CSV.
+
+**PHI — read this (`../radpathsandbox/CLAUDE.md` rules apply):** the `dataset.csv` path columns (`dicom_path`, `synthentic_path`, `*_Synthetic`, `SYMAPS`) can embed PHI in directory names. `preprocess_dicom_to_nifti.py` therefore **hides literal paths in its diagnostics by default**, printing only resolution status + `AnonymizationID`. The `--show-paths` flag reveals full paths and is for **local debugging only — never paste/commit its output**. Do not add diagnostics that echo these paths by default. See the `cohort-csv-paths-are-phi` project memory.
+
+Inspect a converted patient in ITK-SNAP: `./view_patient.sh <AnonymizationID> [processed_dir]` (loads T1W as main, the rest as overlays; use `list` to enumerate patients; pass `processed_resampled` to view the resampled set).
+
 ## Architecture
 
 **Script-oriented with heavy duplication, not a shared library.** Each runnable `.m` inlines its own copies of helpers (`readNii`, `pickVar`, `matchExisting`, `synthSignals`, `sigmoid`, `normalizeContrasts`, …). When fixing a helper, expect to change it in several files. The only genuinely shared function is `ccc_barnes.m` (concordance correlation coefficient, the primary agreement metric). Coupling between scripts is by **data flow on disk**, not function calls:
@@ -42,6 +59,6 @@ Script groups:
 
 - Several data-prep scripts have **hard-coded Windows absolute paths** (e.g. `C:\Users\MNandyala\...` in `ConvertPatientDatatoCSV.m`, `DataProcessing.m`) that must be edited before running elsewhere.
 - One readme filename contains a literal space: `readme_ run_qmri_3dcnn_NonNormalSingalAllPatientsTraining.txt`.
-- `README_qMRI_Workflow.md` and `.txt` are duplicate copies — keep them in sync if edited.
+- `README_qMRI_Workflow.md` is the single workflow doc (the old `.txt` duplicate was removed).
 - TV / edge-aware regularizers (`tvCharb`, `l2smooth`, `computeEdgeWeights`) are implemented but currently commented out in the loss.
-- `doc/fulldataset.md` describes an intended next step (run over a full PHI-indexed CSV dataset) and points to an external `../radpathsandbox/CLAUDE.md` PHI-protection workflow: never print/commit PHI data values — work with column names, dtypes, counts, and aggregate stats only.
+- PHI: never print/commit data values, and treat `dataset.csv` path columns as PHI (see the "Current MAGiC CSV cohort" section and `../radpathsandbox/CLAUDE.md`). Work with column names, counts, and status only. `--show-paths` is debug-only.
