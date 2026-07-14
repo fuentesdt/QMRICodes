@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Convert the MAGiC synthetic DICOM cohort to NIfTI for the qMRI 3D-CNN pipeline.
 
-The cohort CSV (schema in doc/fulldataset.md) indexes each patient's synthetic
-contrasts as DICOM series in the columns ``T1W Synthetic``, ``T2W Synthetic``,
-``FLAIR Synthetic`` and ``PS Synthetic``. This script converts each series to
-NIfTI under ``<out>/<AnonymizationID>/`` (T1W.nii.gz, T2W.nii.gz, FLAIR.nii.gz,
-PD.nii.gz) using SimpleITK, and stamps the pulse-sequence acquisition parameters
-(TR/TE/FA/TI) read from the DICOM header into each NIfTI's ``descrip`` field so
-the MATLAB pipeline (readAcqParams) can read them back via niftiinfo().Description.
+The cohort CSV (schema in doc/fulldataset.md) indexes, per patient:
+  - weighted synthetic contrasts, one DICOM series each, in the columns
+    ``T1W Synthetic`` / ``T2W Synthetic`` / ``FLAIR Synthetic`` (and ``PS Synthetic``);
+  - ``SYMAPS``: a directory (under ``synthentic_path``) holding the quantitative
+    T1 / T2 / PD maps as per-slice DICOM files named ``SYMAPS_<NN>_{T1,T2,PD}.dcm``.
+
+This script writes NIfTI under ``<out>/<AnonymizationID>/``:
+  T1W.nii.gz, T2W.nii.gz, FLAIR.nii.gz            (weighted inputs)
+  T1map.nii.gz, T2map.nii.gz, PD.nii.gz           (quantitative references, from SYMAPS)
+  PS.nii.gz                                        (if a PS Synthetic column is present)
+Each weighted NIfTI's ``descrip`` header field is stamped with the pulse-sequence
+acquisition parameters (TR/TE/FA/TI) read from its DICOM, so the MATLAB pipeline
+(readAcqParams) can read them back via niftiinfo().Description.
 
 Run this BEFORE the MATLAB training/prediction scripts, e.g.:
 
@@ -23,7 +29,9 @@ dropped, not copied.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import re
 import sys
 
 import pandas as pd
@@ -31,17 +39,22 @@ import SimpleITK as sitk
 import nibabel as nib
 
 # ----------------------------------------------------------------------------
-# Contrast table: (candidate CSV column names, output basename, tags to store).
-# Tags map to the physics forward model in the MATLAB pipeline:
+# Weighted contrasts: (candidate CSV column names, output basename, tags to store).
+# Each column is a single DICOM series. Tags map to the physics forward model:
 #   T1w (SPGR/GRE) -> TR, TE, FA ;  T2w (SE) -> TR, TE ;  FLAIR (IR) -> TR, TE, TI
-# PD carries no timing tags (it is a quantitative map, not a weighted signal).
+# PS is a synthetic weighted contrast (not the PD map); stored for completeness.
 # ----------------------------------------------------------------------------
 CONTRASTS = [
-    (["T1W Synthetic", "T1W_Synthetic", "T1W"],     "T1W",   ["TR", "TE", "FA"]),
-    (["T2W Synthetic", "T2W_Synthetic", "T2W"],     "T2W",   ["TR", "TE"]),
+    (["T1W Synthetic", "T1W_Synthetic", "T1W"],       "T1W",   ["TR", "TE", "FA"]),
+    (["T2W Synthetic", "T2W_Synthetic", "T2W"],       "T2W",   ["TR", "TE"]),
     (["FLAIR Synthetic", "FLAIR_Synthetic", "FLAIR"], "FLAIR", ["TR", "TE", "TI"]),
-    (["PS Synthetic", "PD Synthetic", "PS_Synthetic"], "PD",  []),
+    (["PS Synthetic", "PS_Synthetic"],                "PS",    []),
 ]
+
+# SYMAPS quantitative maps: filename suffix in SYMAPS_<NN>_<suffix>.dcm -> output.
+# Each is a stack of per-slice DICOM files sharing that suffix, in one directory.
+SYMAP_TYPES = [("T1", "T1map"), ("T2", "T2map"), ("PD", "PD")]
+SYMAPS_COLS = ["SYMAPS", "SyMaps", "symaps", "SYMAP"]
 
 # DICOM attribute name for each short tag key we store.
 TAG_ATTR = {
@@ -124,6 +137,47 @@ def read_series(path: str) -> sitk.Image:
     return sitk.ReadImage(path)
 
 
+def _slice_sort_key(f: str):
+    """Sort key for a SYMAPS slice: prefer through-plane position, else file index."""
+    idx = None
+    m = re.search(r"_(\d+)_[A-Za-z0-9]+\.dcm$", os.path.basename(f))
+    if m:
+        idx = int(m.group(1))
+    try:
+        import pydicom
+        ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+        ipp = [float(x) for x in getattr(ds, "ImagePositionPatient", [])]
+        iop = [float(x) for x in getattr(ds, "ImageOrientationPatient", [])]
+        if len(ipp) == 3 and len(iop) == 6:
+            r, c = iop[:3], iop[3:]
+            n = (r[1] * c[2] - r[2] * c[1],
+                 r[2] * c[0] - r[0] * c[2],
+                 r[0] * c[1] - r[1] * c[0])
+            return (0, sum(a * b for a, b in zip(ipp, n)))
+    except Exception:
+        pass
+    return (1, idx if idx is not None else 0)
+
+
+def read_map_series(symaps_dir: str, suffix: str) -> sitk.Image:
+    """Build one SYMAPS quantitative map (T1/T2/PD) from its per-slice DICOM files.
+
+    Files are ``SYMAPS_<NN>_<suffix>.dcm``; they are gathered, ordered by slice
+    position (falling back to the <NN> index), and stacked. RescaleSlope/Intercept
+    are applied by the reader so the NIfTI holds real map values.
+    """
+    files = glob.glob(os.path.join(symaps_dir, f"*_{suffix}.dcm"))
+    if not files:  # case-insensitive fallback
+        files = [f for f in glob.glob(os.path.join(symaps_dir, "*"))
+                 if os.path.isfile(f) and f.upper().endswith(f"_{suffix.upper()}.DCM")]
+    if not files:
+        raise FileNotFoundError(f"no *_{suffix}.dcm files in SYMAPS directory")
+    files = sorted(files, key=_slice_sort_key)
+    reader = sitk.ImageSeriesReader()
+    reader.SetFileNames(files)
+    return reader.Execute()
+
+
 def first_dicom_file(path: str) -> str:
     """A representative DICOM file for header reading (series dir -> first slice)."""
     if os.path.isfile(path):
@@ -193,7 +247,8 @@ def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
         ("T1W Synthetic",   ["T1W Synthetic", "T1W_Synthetic", "T1W"]),
         ("T2W Synthetic",   ["T2W Synthetic", "T2W_Synthetic", "T2W"]),
         ("FLAIR Synthetic", ["FLAIR Synthetic", "FLAIR_Synthetic", "FLAIR"]),
-        ("PS Synthetic",    ["PS Synthetic", "PD Synthetic", "PS_Synthetic"]),
+        ("SYMAPS",          SYMAPS_COLS),
+        ("PS Synthetic",    ["PS Synthetic", "PS_Synthetic"]),
     ):
         resolved, raw, _ = resolve_source(row, cands, data_root)
         if raw == "":
@@ -275,6 +330,33 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
             except Exception as exc:  # never abort the whole cohort
                 print(f"[fail] {anon}/{base}: {type(exc).__name__}: {exc}")
                 n_fail += 1
+
+        # SYMAPS quantitative maps (T1map/T2map/PD) from one directory of
+        # per-slice DICOM files split by filename suffix.
+        sym_dir, sym_raw, sym_tried = resolve_source(row, SYMAPS_COLS, data_root)
+        if sym_raw and not sym_dir:
+            print(f"[skip] {anon}/SYMAPS: dir not found | value={sym_raw!r} "
+                  f"tried={sym_tried}")
+            n_fail += 1
+        elif sym_dir:
+            for suffix, base in SYMAP_TYPES:
+                out_path = os.path.join(pdir, base + ".nii.gz")
+                if os.path.exists(out_path) and not overwrite:
+                    print(f"[keep] {anon}/{base}: exists")
+                    n_ok += 1
+                    continue
+                if dry_run:
+                    print(f"[dry ] {anon}/{base} <- SYMAPS *_{suffix} in {sym_dir}")
+                    n_ok += 1
+                    continue
+                try:
+                    img = read_map_series(sym_dir, suffix)
+                    sitk.WriteImage(sitk.Cast(img, sitk.sitkFloat32), out_path)
+                    print(f"[ok  ] {anon}/{base} (SYMAPS *_{suffix})")
+                    n_ok += 1
+                except Exception as exc:
+                    print(f"[fail] {anon}/{base}: {type(exc).__name__}: {exc}")
+                    n_fail += 1
 
     print(f"[done] patients={n_pat} converted/kept={n_ok} failed/skipped={n_fail}")
     return 0 if n_fail == 0 else 1

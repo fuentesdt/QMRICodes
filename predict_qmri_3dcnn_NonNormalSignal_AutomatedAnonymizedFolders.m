@@ -40,7 +40,7 @@ end
 config.idCol     = "AnonymizationID";
 config.csvName   = "dataset.csv";
 config.requireMatched = true;
-config.useRefMaps     = false;    % this cohort exports weighted contrasts (+ PD) only
+config.useRefMaps     = true;     % SYMAPS provides quantitative T1/T2/PD references
 config.predictAll     = false;    % false = held-out fold only; true = all patients
 
 % Acquisition parameters are read per patient from the NIfTI header 'descrip'

@@ -43,17 +43,17 @@ config.acq = [   0,    0,    0,     0,    0,      0,       0,       0 ];   % opt
 % ---- Reference quantitative maps -----------------------------------------
 % true  -> train against PD/T1/T2 reference maps (parameter L1 term active).
 % false -> signal-only training (lamPD/lamT1/lamT2 forced to 0, refs = zeros).
-% This cohort exports only weighted contrasts (+ PD), so default is signal-only.
-config.useRefMaps = false;
+% The SYMAPS column supplies quantitative T1/T2/PD maps, so default is supervised.
+config.useRefMaps = true;
 
 % Fixed NIfTI basenames inside <processedRoot>/<AnonymizationID>/ (produced by
-% preprocess_dicom_to_nifti.py). T1map/T2map are only needed if useRefMaps=true.
+% preprocess_dicom_to_nifti.py). PD/T1map/T2map come from the SYMAPS maps.
 config.fileT1w     = "T1W.nii.gz";      % Synthetic T1W signal
 config.fileT2w     = "T2W.nii.gz";      % Synthetic T2W signal
 config.fileFLAIR   = "FLAIR.nii.gz";    % Synthetic FLAIR signal
-config.filePDref   = "PD.nii.gz";       % Reference PD map (from PS Synthetic)
-config.fileT1ref   = "T1map.nii.gz";    % Reference T1 map (optional)
-config.fileT2ref   = "T2map.nii.gz";    % Reference T2 map (optional)
+config.filePDref   = "PD.nii.gz";       % Reference PD map  (SYMAPS *_PD)
+config.fileT1ref   = "T1map.nii.gz";    % Reference T1 map  (SYMAPS *_T1)
+config.fileT2ref   = "T2map.nii.gz";    % Reference T2 map  (SYMAPS *_T2)
 config.fileMask    = "mask.nii.gz";     % Mask of skull-stripped brain (optional)
 
 %% ===================== 0.1) READ COHORT CSV ======================
