@@ -23,8 +23,11 @@ Because the CSV's contrasts/maps are **DICOM**, a Python/SimpleITK step runs **b
 - Converts `T1W/T2W/FLAIR Synthetic` (one DICOM series each) → `processed/<AnonymizationID>/{T1W,T2W,FLAIR}.nii.gz`, stamping TR/TE/FA/TI from the DICOM into each NIfTI header `descrip` (MATLAB reads it back via `niftiinfo().Description`; `readAcqParams`).
 - Converts `SYMAPS` (a dir of per-slice `SYMAPS_<NN>_{T1,T2,PD}.dcm`) → `T1map/T2map/PD.nii.gz` (the quantitative references; `RescaleSlope/Intercept` applied).
 - `PS Synthetic` is intentionally **not** converted (phase-sensitive; unused).
-- `--resample` mirrors a patient onto the T1W grid in a **separate** `processed_resampled/` dir when SYMAPS and weighted grids differ (else copies).
+- After converting, it checks **per-patient grid consistency by default** (`[grids] N/total need --resample`); `--check-grids` runs only that check on an existing dir. Analysis is **per-patient and masked-to-brain**, so only a *single patient's* SYMAPS-vs-weighted grid mismatch matters — inter-patient slice-count differences are irrelevant. `--resample` mirrors a patient onto the T1W grid in a **separate** `processed_resampled/` dir when needed (else copies).
+- Optional **brain mask** (skull-strip): `skullstrip_hdbet.py --processed processed` runs HD-BET on T1W → `processed/<id>/mask.nii.gz` (what MATLAB's `config.fileMask` expects; else it falls back to nonzero-T1W). HD-BET is an optional dep (`pip install HD-BET`).
 - Setup: `python3 -m venv /opt/qmricodes && /opt/qmricodes/bin/pip install -r requirements.txt`.
+
+**MIST tumor model (separate `/home/fuentes/github/MIST` repo):** its tumor net is a fixed **4-channel** `t1,t2,tc,fl` net with **no missing-modality support**. This cohort has **no TC** (post-contrast T1), which **cannot be synthesized from MAGiC**. To apply MIST you must either retrain a 3-channel (T1/T2/FLAIR) model (needs tumor labels), feed a T1-as-TC surrogate (degraded ET/tumor-core), or supply real T1c from PACS. Not yet implemented — decision pending.
 
 MATLAB side (both recommended scripts): read `dataset.csv` (+ PHI-free `cv_folds.csv` manifest), group patients by `AnonymizationID` into 5 folds, models → `trained_models_Fold<f>/`, predictions → `<outRoot>/<AnonymizationID>/Fold<f>_Predictions/`. Set `config.processedRoot` (default `<rootDir>/processed`; point at `processed_resampled/` if you ran `--resample`). Acq params come from the NIfTI `descrip`, not the CSV.
 

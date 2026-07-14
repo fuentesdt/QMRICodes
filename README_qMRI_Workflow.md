@@ -159,12 +159,26 @@ Then invoke the preprocessor with that interpreter, e.g.
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
    Add --require-matched to convert only rows with a valid match_status.
 
-   If the SYMAPS maps and the weighted contrasts were exported on different voxel
-   grids (MATLAB will error "Size mismatch ..."), add --resample. It mirrors each
-   patient onto the T1W input grid in a SEPARATE directory (default
-   processed_resampled/): volumes whose grid differs are linearly resampled, the
-   rest are copied. Then set config.processedRoot to that *_resampled directory.
+   Grid check: the preprocessor checks per-patient grid consistency BY DEFAULT
+   after converting and prints "[grids] N/total patients need --resample". Only a
+   patient whose own volumes disagree needs resampling; different slice counts
+   BETWEEN patients are fine (each patient is processed independently). Re-check an
+   existing dir any time (no CSV needed):
+     /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --check-grids --out processed
+
+   If a patient's SYMAPS maps and weighted contrasts are on different voxel grids
+   (MATLAB will error "Size mismatch ..."), add --resample. It mirrors each patient
+   onto the T1W input grid in a SEPARATE directory (default processed_resampled/):
+   volumes whose grid differs are linearly resampled, the rest are copied. Then set
+   config.processedRoot to that *_resampled directory.
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed --resample
+
+   Optional brain masks (skull-strip): the MATLAB pipeline confines training
+   patches + loss + CCC to a brain mask (mask.nii.gz); without one it falls back to
+   nonzero-T1W. Generate proper masks with HD-BET (install: pip install HD-BET),
+   run after conversion, before MATLAB:
+     /opt/qmricodes/bin/python3 skullstrip_hdbet.py --processed processed --device cpu
+   It writes processed/<id>/mask.nii.gz on the T1W grid.
 
    PHI: the preprocessor HIDES literal file paths in its diagnostics by default
    (the dataset.csv path columns can embed PHI). Its default output is safe to

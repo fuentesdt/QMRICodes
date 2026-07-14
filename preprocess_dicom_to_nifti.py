@@ -16,6 +16,11 @@ Each weighted NIfTI's ``descrip`` header field is stamped with the pulse-sequenc
 acquisition parameters (TR/TE/FA/TI) read from its DICOM, so the MATLAB pipeline
 (readAcqParams) can read them back via niftiinfo().Description.
 
+After converting, it checks per-patient grid consistency by default and prints
+which patients (if any) need --resample (the MATLAB pipeline requires each
+patient's volumes on one grid). Use --check-grids to run only that check on an
+existing output dir, --no-grid-check to skip it, --show-ok to also list matches.
+
 Run this BEFORE the MATLAB training/prediction scripts, e.g.:
 
     python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
@@ -250,6 +255,61 @@ def _grid(img: sitk.Image):
             tuple(round(d, 5) for d in img.GetDirection()))
 
 
+# Output basenames whose grids must agree within a patient for the MATLAB pipeline.
+GRID_CHECK_FILES = ["T1W", "T2W", "FLAIR", "T1map", "T2map", "PD", "mask"]
+
+
+def check_grids(out_root: str, ids=None, show_ok: bool = False) -> int:
+    """Report, per patient, whether the converted volumes share one voxel grid.
+
+    The MATLAB pipeline requires every volume of a patient (weighted contrasts,
+    SYMAPS maps, mask) on one grid; a mismatch means that patient needs --resample.
+    Reads only the NIfTI headers under <out_root>/<AnonymizationID>/ (no CSV/DICOM,
+    PHI-safe: only AnonymizationID + basenames are printed). Returns the number of
+    patients that need resampling.
+    """
+    if not os.path.isdir(out_root):
+        print(f"[grids] no such dir: {out_root}")
+        return 0
+    if ids is None:
+        ids = sorted(d for d in os.listdir(out_root)
+                     if os.path.isdir(os.path.join(out_root, d)))
+
+    n_total = n_bad = 0
+    for anon in ids:
+        pdir = os.path.join(out_root, anon)
+        present = [(b, os.path.join(pdir, b + ".nii.gz")) for b in GRID_CHECK_FILES
+                   if os.path.isfile(os.path.join(pdir, b + ".nii.gz"))]
+        if not present:
+            continue
+        n_total += 1
+        # Reference = T1W if present, else the first available volume.
+        ref_name, ref_path = next((p for p in present if p[0] == "T1W"), present[0])
+        try:
+            ref_sig = _grid(sitk.ReadImage(ref_path))
+        except Exception as exc:
+            print(f"[grids] {anon}: cannot read {ref_name} ({type(exc).__name__})")
+            n_bad += 1
+            continue
+        diffs = []
+        for base, path in present:
+            if base == ref_name:
+                continue
+            try:
+                if _grid(sitk.ReadImage(path)) != ref_sig:
+                    diffs.append(base)
+            except Exception:
+                diffs.append(base + "(unreadable)")
+        if diffs:
+            n_bad += 1
+            print(f"[grids] {anon}: MISMATCH vs {ref_name} -> {', '.join(diffs)}")
+        elif show_ok:
+            print(f"[grids] {anon}: OK ({len(present)} volumes share {ref_name} grid)")
+
+    print(f"[grids] {n_bad}/{n_total} patients need --resample ({n_total - n_bad} ok)")
+    return n_bad
+
+
 def resample_patient(pdir: str, rpdir: str, ref_base: str = "T1W") -> int:
     """Mirror one patient's NIfTI set from pdir into rpdir on a common grid.
 
@@ -334,7 +394,8 @@ def _kind(val: str) -> str:
 
 def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
         overwrite: bool, dry_run: bool, data_root: str,
-        resample: bool, resampled_out: str, show_paths: bool) -> int:
+        resample: bool, resampled_out: str, show_paths: bool,
+        grid_check: bool, show_ok: bool) -> int:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 
     # Resolve the id column case-insensitively.
@@ -354,6 +415,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
         preview_first_row(df.iloc[0], id_real, data_root, show_paths)
 
     seen = set()
+    processed_ids = []
     n_ok = n_fail = n_pat = n_resampled = 0
     for _, row in df.iterrows():
         anon = str(row[id_real]).strip()
@@ -365,6 +427,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
         if require_matched and not is_matched(row):
             continue
         n_pat += 1
+        processed_ids.append(anon)
 
         pdir = os.path.join(out_root, anon)
         if not dry_run:
@@ -450,13 +513,22 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
           + (f" resampled_patients={n_resampled}" if resample else ""))
     if resample:
         print(f"[done] point MATLAB config.processedRoot at {os.path.abspath(resampled_out)}")
+
+    # Per-patient grid consistency check (on by default; needs files on disk).
+    if grid_check and not dry_run:
+        need = check_grids(out_root, ids=processed_ids, show_ok=show_ok)
+        if need and not resample:
+            print("[grids] re-run with --resample (writes a separate *_resampled dir) "
+                  "for the patients above, or none if the mismatch is expected.")
+
     return 0 if n_fail == 0 else 1
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", required=True, help="cohort CSV (doc/fulldataset.md schema)")
+    ap.add_argument("--csv", help="cohort CSV (doc/fulldataset.md schema); "
+                                   "not needed with --check-grids")
     ap.add_argument("--out", default="processed", help="output root (default: processed)")
     ap.add_argument("--id-col", default="AnonymizationID", help="patient id column")
     ap.add_argument("--data-root", default="",
@@ -477,10 +549,22 @@ def main() -> int:
     ap.add_argument("--show-paths", action="store_true",
                     help="reveal literal file paths in diagnostics (may contain "
                          "PHI); off by default so logs stay PHI-safe")
+    ap.add_argument("--check-grids", action="store_true",
+                    help="ONLY check per-patient grid consistency under --out and "
+                         "exit (no conversion, no CSV needed)")
+    ap.add_argument("--no-grid-check", action="store_true",
+                    help="skip the automatic post-conversion grid check")
+    ap.add_argument("--show-ok", action="store_true",
+                    help="in the grid check, also list patients whose grids match")
     args = ap.parse_args()
 
-    if not os.path.isfile(args.csv):
-        sys.exit(f"[error] CSV not found: {args.csv}")
+    # Standalone grid check: read existing <out>/<id>/ NIfTI headers, no CSV/DICOM.
+    if args.check_grids:
+        need = check_grids(args.out, show_ok=args.show_ok)
+        return 1 if need else 0
+
+    if not args.csv or not os.path.isfile(args.csv):
+        sys.exit(f"[error] CSV not found: {args.csv!r} (required unless --check-grids)")
 
     resampled_out = args.resampled_out
     if args.resample and not resampled_out:
@@ -488,7 +572,8 @@ def main() -> int:
 
     return run(args.csv, args.out, args.id_col, args.require_matched,
                args.overwrite, args.dry_run, args.data_root,
-               args.resample, resampled_out, args.show_paths)
+               args.resample, resampled_out, args.show_paths,
+               grid_check=not args.no_grid_check, show_ok=args.show_ok)
 
 
 if __name__ == "__main__":
