@@ -99,9 +99,13 @@ for f = 1:config.numFolds
         mkdir(config.outDir);
     end
 
-    % Training Network architechture definition
-    config.patchSize   = [64 64 64];   % [Z Y X]
-    config.patchStride = [32 32 32];
+    % Training Network architechture definition.
+    % Patch dims are [dim1 dim2 sliceDim]; the 3rd is the through-plane (axial
+    % slice) dimension. The MAGiC cohort is thin there (~27-30 slices), so the
+    % 3rd patch dim must fit it. All dims must be divisible by 8 (the U-Net has 3
+    % downsampling steps -> S/8) for the skip connections to line up.
+    config.patchSize   = [64 64 16];
+    config.patchStride = [32 32 8];
     config.baseFilters = 32;
     config.maxEpochs   = 200;
     config.learnRate   = 2e-4;
@@ -543,14 +547,23 @@ S1 = S{1}; S2 = S{2}; S3 = S{3};
 end
 
 function patches = extractPatches3D(S1,S2,S3,PD,T1,T2,M,ps,st)
-% Extract overlapping 3D patches; require >=20% mask coverage
-sz = size(M); idxs = [];
-for z=1:st(1):max(1,sz(1)-ps(1)+1)
-    for y=1:st(2):max(1,sz(2)-ps(2)+1)
-        for x=1:st(3):max(1,sz(3)-ps(3)+1)
+% Extract overlapping 3D patches; require >=20% mask coverage.
+% Zero-pads any volume thinner than the patch (so few-slice acquisitions do not
+% overrun) and includes the last valid start per axis so patches reach the edge.
+sz = size(M); sz(end+1:3) = 1;
+if any(ps(1:3) > sz(1:3))
+    S1 = padTo(S1,ps); S2 = padTo(S2,ps); S3 = padTo(S3,ps);
+    PD = padTo(PD,ps); T1 = padTo(T1,ps); T2 = padTo(T2,ps); M = padTo(M,ps);
+    sz = size(M); sz(end+1:3) = 1;
+end
+
+idxs = [];
+for z = startPositions(sz(1), ps(1), st(1))
+    for y = startPositions(sz(2), ps(2), st(2))
+        for x = startPositions(sz(3), ps(3), st(3))
             m = M(z:z+ps(1)-1, y:y+ps(2)-1, x:x+ps(3)-1);
             if nnz(m) < 0.2*numel(m), continue; end
-            idxs(end+1,:)=[z y x];
+            idxs(end+1,:)=[z y x]; %#ok<AGROW>
         end
     end
 end
@@ -576,6 +589,25 @@ parfor i=1:size(idxs,1)
         'T1',     single(T1p), ...
         'T2',     single(T2p), ...
         'mask',   logical(Mp) );
+end
+end
+
+function p = startPositions(n, ps, st)
+% Patch start indices along one axis: 1:st:last, always including the last valid
+% start (n-ps+1) so the trailing slices/rows are covered.
+last = max(1, n - ps + 1);
+p = 1:st:last;
+if isempty(p) || p(end) ~= last
+    p = [p, last];
+end
+end
+
+function V = padTo(V, ps)
+% Zero-pad V up to at least ps in each of its first 3 dims (padding at the end).
+sz = size(V); sz(end+1:3) = 1;
+pad = max(0, ps(1:3) - sz(1:3));
+if any(pad > 0)
+    V = padarray(V, pad, 0, 'post');
 end
 end
 
