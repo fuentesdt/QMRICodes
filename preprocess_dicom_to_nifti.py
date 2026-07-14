@@ -21,10 +21,12 @@ Run this BEFORE the MATLAB training/prediction scripts, e.g.:
     python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
 
 PHI protection (see ../radpathsandbox/CLAUDE.md): only AnonymizationID and the
-contrast name are ever printed or used in output paths; MRN / Study UID /
-Series UID are never logged or written. The produced NIfTI carries only pixel
-data, geometry, and the numeric acquisition ``descrip`` -- DICOM header PHI is
-dropped, not copied.
+contrast name are printed by default; MRN / Study UID / Series UID are never
+logged or written. The CSV path columns (dicom_path, synthentic_path,
+*_Synthetic) can embed PHI, so literal paths are hidden in diagnostics unless
+--show-paths is passed (use only for local debugging). The produced NIfTI carries
+only pixel data, geometry, and the numeric acquisition ``descrip`` -- DICOM header
+PHI is dropped, not copied.
 """
 
 from __future__ import annotations
@@ -284,11 +286,17 @@ def resample_patient(pdir: str, rpdir: str, ref_base: str = "T1W") -> int:
     return n_res
 
 
-def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
-    """Print the path-like column values for the first patient so the operator can
-    see what the contrast columns actually contain (path? flag? relative name?)."""
+def preview_first_row(row: pd.Series, id_real: str, data_root: str,
+                      show_paths: bool) -> None:
+    """Report, for the first patient, whether each path-like column resolves.
+
+    PHI-safe by default: the CSV path columns can embed PHI (patient folder names,
+    MRNs), so the literal path strings are shown ONLY with --show-paths. Otherwise
+    just the resolution status and whether the value is absolute/relative is shown.
+    """
     anon = str(row[id_real]).strip()
-    print(f"[preview] first patient {anon} -- raw column values:")
+    print(f"[preview] first patient {anon} -- column resolution"
+          + ("" if show_paths else " (paths hidden; --show-paths to reveal)") + ":")
     for label, cands in (
         ("dicom_path",      ["dicom_path"]),
         ("synthentic_path", ["synthentic_path", "synthetic_path"]),
@@ -298,7 +306,8 @@ def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
             print(f"    {label:16s}= <empty/absent>")
         else:
             exists = "exists" if os.path.exists(val) else "NOT a path on this host"
-            print(f"    {label:16s}= {val!r}  ({exists})")
+            detail = f"  {val!r}" if show_paths else f"  ({_kind(val)})"
+            print(f"    {label:16s}= {exists}{detail}")
     for label, cands in (
         ("T1W Synthetic",   ["T1W Synthetic", "T1W_Synthetic", "T1W"]),
         ("T2W Synthetic",   ["T2W Synthetic", "T2W_Synthetic", "T2W"]),
@@ -309,17 +318,23 @@ def preview_first_row(row: pd.Series, id_real: str, data_root: str) -> None:
         if raw == "":
             print(f"    {label:16s}= <empty/absent>")
         elif resolved:
-            print(f"    {label:16s}= {raw!r}  (found -> {resolved})")
+            detail = f" -> {resolved}" if show_paths else ""
+            print(f"    {label:16s}= found{detail}")
         else:
-            print(f"    {label:16s}= {raw!r}  (NOT resolvable to a file/dir)")
-    print("[preview] if the *_Synthetic values are not paths (e.g. True/1), the "
-          "files likely live inside synthentic_path -- use --data-root or tell me "
-          "the layout.")
+            detail = f"  value={raw!r}" if show_paths else f"  ({_kind(raw)})"
+            print(f"    {label:16s}= NOT resolvable to a file/dir{detail}")
+    print("[preview] if a *_Synthetic value is not a path (e.g. True/1), the files "
+          "likely live inside synthentic_path -- use --data-root or tell me the layout.")
+
+
+def _kind(val: str) -> str:
+    """PHI-safe descriptor of a path value: absolute vs relative, no literal path."""
+    return "absolute path" if os.path.isabs(str(val)) else "relative name"
 
 
 def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
         overwrite: bool, dry_run: bool, data_root: str,
-        resample: bool, resampled_out: str) -> int:
+        resample: bool, resampled_out: str, show_paths: bool) -> int:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 
     # Resolve the id column case-insensitively.
@@ -336,7 +351,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
         print(f"[info] resample=on -> {os.path.abspath(resampled_out)} "
               f"(reference grid: T1W)")
     if len(df):
-        preview_first_row(df.iloc[0], id_real, data_root)
+        preview_first_row(df.iloc[0], id_real, data_root, show_paths)
 
     seen = set()
     n_ok = n_fail = n_pat = n_resampled = 0
@@ -362,10 +377,12 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
             if not raw:
                 continue  # contrast column empty/absent for this patient
             if not src:
-                # Show the value read and everything tried, so the operator can
-                # tell whether the cell is a path, a relative name, or a flag.
-                print(f"[skip] {anon}/{base}: source not found | value={raw!r} "
-                      f"tried={tried}")
+                # Report enough to diagnose (relative vs absolute, how many
+                # candidates tried) without leaking the literal PHI-bearing path.
+                print(f"[skip] {anon}/{base}: source not found | "
+                      + (f"value={raw!r} tried={tried}" if show_paths
+                         else f"{_kind(raw)}, {len(tried)} candidate(s) tried, "
+                              f"none exist (--show-paths to reveal)"))
                 n_fail += 1
                 continue
             if os.path.exists(out_path) and not overwrite:
@@ -374,7 +391,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                 continue
 
             if dry_run:
-                print(f"[dry ] {anon}/{base} <- {src}")
+                print(f"[dry ] {anon}/{base}" + (f" <- {src}" if show_paths else ""))
                 n_ok += 1
                 continue
 
@@ -387,15 +404,18 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                 print(f"[ok  ] {anon}/{base} [{tagstr}]")
                 n_ok += 1
             except Exception as exc:  # never abort the whole cohort
-                print(f"[fail] {anon}/{base}: {type(exc).__name__}: {exc}")
+                print(f"[fail] {anon}/{base}: {type(exc).__name__}"
+                      + (f": {exc}" if show_paths else " (--show-paths for detail)"))
                 n_fail += 1
 
         # SYMAPS quantitative maps (T1map/T2map/PD) from one directory of
         # per-slice DICOM files split by filename suffix.
         sym_dir, sym_raw, sym_tried = resolve_source(row, SYMAPS_COLS, data_root)
         if sym_raw and not sym_dir:
-            print(f"[skip] {anon}/SYMAPS: dir not found | value={sym_raw!r} "
-                  f"tried={sym_tried}")
+            print(f"[skip] {anon}/SYMAPS: dir not found | "
+                  + (f"value={sym_raw!r} tried={sym_tried}" if show_paths
+                     else f"{_kind(sym_raw)}, {len(sym_tried)} candidate(s) tried, "
+                          f"none exist (--show-paths to reveal)"))
             n_fail += 1
         elif sym_dir:
             for suffix, base in SYMAP_TYPES:
@@ -405,7 +425,7 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                     n_ok += 1
                     continue
                 if dry_run:
-                    print(f"[dry ] {anon}/{base} <- SYMAPS *_{suffix} in {sym_dir}")
+                    print(f"[dry ] {anon}/{base} <- SYMAPS *_{suffix}")
                     n_ok += 1
                     continue
                 try:
@@ -414,7 +434,8 @@ def run(csv_path: str, out_root: str, id_col: str, require_matched: bool,
                     print(f"[ok  ] {anon}/{base} (SYMAPS *_{suffix})")
                     n_ok += 1
                 except Exception as exc:
-                    print(f"[fail] {anon}/{base}: {type(exc).__name__}: {exc}")
+                    print(f"[fail] {anon}/{base}: {type(exc).__name__}"
+                          + (f": {exc}" if show_paths else " (--show-paths for detail)"))
                     n_fail += 1
 
         # Resample to a common grid (weighted-input space) into a separate dir,
@@ -453,6 +474,9 @@ def main() -> int:
                          "differs are linearly resampled, others copied")
     ap.add_argument("--resampled-out", default="",
                     help="destination for --resample (default: <out>_resampled)")
+    ap.add_argument("--show-paths", action="store_true",
+                    help="reveal literal file paths in diagnostics (may contain "
+                         "PHI); off by default so logs stay PHI-safe")
     args = ap.parse_args()
 
     if not os.path.isfile(args.csv):
@@ -464,7 +488,7 @@ def main() -> int:
 
     return run(args.csv, args.out, args.id_col, args.require_matched,
                args.overwrite, args.dry_run, args.data_root,
-               args.resample, resampled_out)
+               args.resample, resampled_out, args.show_paths)
 
 
 if __name__ == "__main__":

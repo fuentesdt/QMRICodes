@@ -188,9 +188,11 @@ Before running the MATLAB scripts, edit the CONFIG block at the top of each:
 
 PHI PROTECTION (see ../radpathsandbox/CLAUDE.md):
 Only AnonymizationID is ever printed or used in file/folder names. MRN, Study
-UID, and Series UID are never logged or written. Every required input file is
-gated by requireFile() (fail fast) before it is read. cv_folds.csv contains only
-AnonymizationID and fold number.
+UID, and Series UID are never logged or written. The CSV path columns
+(dicom_path, synthentic_path, *_Synthetic) may embed PHI, so the preprocessor
+hides literal paths in its diagnostics by default -- pass --show-paths only for
+local debugging. Every required input file is gated by requireFile() (fail fast)
+before it is read. cv_folds.csv contains only AnonymizationID and fold number.
 
 --------------------------------------------------
 NOTES
