@@ -146,7 +146,7 @@ for f = 1:config.numFolds
     %% ===================== 1) DEVICE SELECT ===================
     useGPU = canUseGPU();
     if useGPU
-        g = gpuDevice(3); fprintf('[Device] Using GPU: %s\n', g.Name);
+        g = gpuDevice(1); fprintf('[Device] Using GPU: %s\n', g.Name);
     else
         fprintf('[Device] No GPU detected. Using CPU (multithread if available).\n');
         try, if isempty(gcp('nocreate')); parpool('threads'); end, catch, end

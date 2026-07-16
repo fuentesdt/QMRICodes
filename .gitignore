@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 # Preprocessing output (converted NIfTI cohort; may contain patient imaging)
+dataset.csv
 processed/
 
 # Pipeline artifacts
