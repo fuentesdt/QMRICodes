@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Conventions (always follow)
+
+- **Keep `README_qMRI_Workflow.md` current.** Whenever you add a script or change how an existing one is invoked (new/renamed flags, arguments, inputs/outputs, or workflow order), update `README_qMRI_Workflow.md` in the same change — add the new script to the workflow with an example command, and update the usage for changed flags. A code change that alters user-facing usage is not complete until the README reflects it.
+
 ## What this is
 
 MATLAB research code for **physics-guided quantitative MRI (qMRI) parameter mapping**. A 3D U-Net takes three routine structural contrasts (T1w, T2w, FLAIR) as input and predicts six maps — PD, T1, T2, and three signal-gain terms g1/g2/g3. The key idea: predicted maps are pushed back through MR signal equations (SPGR/GRE, spin-echo, inversion-recovery) to re-synthesize the input images, and the loss compares synthesized-vs-measured signal plus an L1 term against reference SyMRI/MAGiC maps. There is no build system, package manager, or test suite — scripts are run interactively from within MATLAB.
